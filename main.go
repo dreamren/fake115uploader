@@ -234,12 +234,21 @@ func exitPrint() {
 // 进行 http 请求
 func doRequest(req *http.Request) (resp *http.Response, err error) {
 	for i := 0; i < int(config.HTTPRetry+1); i++ {
+		if i > 0 {
+			// 重试前重置请求体
+			if req.GetBody != nil {
+				if body, e := req.GetBody(); e == nil {
+					req.Body = body
+				}
+			}
+			// 重试前退避一段时间
+			time.Sleep(time.Duration(i) * time.Second)
+		}
 		resp, err = httpClient.Do(req)
 		if err == nil {
 			return resp, nil
-		} else if *verbose {
-			log.Printf("http 请求出现错误：%v", err)
 		}
+		log.Printf("http 请求出现错误（第%d次尝试）：%v", i+1, err)
 	}
 
 	return nil, fmt.Errorf("http 请求出现错误：%w", err)
@@ -617,9 +626,6 @@ func main() {
 
 					if d.IsDir() {
 
-						// 等待一秒
-						time.Sleep(time.Second)
-
 						if err != nil {
 							log.Printf("获取文件夹 %s 的信息出现错误，取消上传该文件夹：%v", path, err)
 							return fs.SkipDir
@@ -694,12 +700,8 @@ func main() {
 	}
 
 	for _, file := range files {
-		// 等待一秒
-		time.Sleep(time.Second)
 		file.uploadFile()
 	}
-	// 等待一秒
-	time.Sleep(time.Second)
 }
 
 // 上传文件

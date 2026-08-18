@@ -27,16 +27,25 @@ type saveProgress struct {
 
 // 进度监听
 type multipartProgressListener struct {
+	last int64 // 上一次进度事件时该分片已上传的字节数
 }
 
 // 实现 oss.ProgressListener 的接口
 func (listener *multipartProgressListener) ProgressChanged(event *oss.ProgressEvent) {
 	switch event.EventType {
 	case oss.TransferStartedEvent:
+		listener.last = 0
 	case oss.TransferDataEvent:
+		// 实时更新进度，避免上传大文件时进度条长时间停留在 0%
+		bar.Add64(event.ConsumedBytes - listener.last)
+		listener.last = event.ConsumedBytes
 	case oss.TransferCompletedEvent:
-		bar.Add64(event.ConsumedBytes)
+		bar.Add64(event.ConsumedBytes - listener.last)
+		listener.last = 0
 	case oss.TransferFailedEvent:
+		// 分片上传失败，回滚该分片已计入进度的字节数
+		bar.Add64(-listener.last)
+		listener.last = 0
 	default:
 	}
 }
@@ -96,15 +105,13 @@ func multipartUploadFile(ft *fastToken, file string, sp *saveProgress) (e error)
 	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
 
-	f, err := os.Open(file)
-	checkErr(err)
-	defer f.Close()
-	info, err := f.Stat()
+	info, err := os.Stat(file)
 	checkErr(err)
 
 	if sp == nil {
 		// 断点续传模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 		if info.Size() <= 1024 {
+			// 此时不能打开文件，否则文件被占用会导致上传后删除文件失败
 			log.Printf("%s 的大小小于1KB，改用普通模式上传", file)
 			return ossUploadFile(ft, file)
 		}
@@ -144,11 +151,20 @@ func multipartUploadFile(ft *fastToken, file string, sp *saveProgress) (e error)
 		checkErr(err)
 	}
 
+	f, err := os.Open(file)
+	checkErr(err)
+	defer f.Close()
+
 	fmt.Println("按 q 键停止上传并退出程序，断点续传模式会自动保存上传进度")
-	bar = pb.New64(info.Size()).SetTemplate(pb.Full).Set(pb.Bytes, true)
+	// 已成功上传的分片总字节数
+	var committed int64
 	if sp != nil {
-		bar.SetCurrent(int64(len(sp.Parts)) * sp.Chunks[0].Size)
+		for _, c := range chunks[:len(parts)] {
+			committed += c.Size
+		}
 	}
+	bar = pb.New64(info.Size()).SetTemplate(pb.Full).Set(pb.Bytes, true)
+	bar.SetCurrent(committed)
 	bar.Start()
 	defer bar.Finish()
 
@@ -176,6 +192,9 @@ func multipartUploadFile(ft *fastToken, file string, sp *saveProgress) (e error)
 			multipartCh <- struct{}{}
 			return errStopUpload
 		default:
+			if *verbose {
+				log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
+			}
 			var part oss.UploadPart
 			// 出现错误就继续尝试，共尝试 3 次
 			for retry := 0; retry < 3; retry++ {
@@ -196,8 +215,11 @@ func multipartUploadFile(ft *fastToken, file string, sp *saveProgress) (e error)
 					break
 				} else {
 					log.Printf("上传 %s 的第%d个分片时出现错误：%v", file, chunk.Number, err)
+					// 回滚失败分片已显示的进度
+					bar.SetCurrent(committed)
 					if retry != 2 {
-						log.Printf("尝试重新上传第%d个分片", chunk.Number)
+						log.Printf("等待 %d 秒后尝试重新上传第%d个分片", retry+1, chunk.Number)
+						time.Sleep(time.Duration(retry+1) * time.Second)
 					}
 				}
 			}
@@ -214,6 +236,7 @@ func multipartUploadFile(ft *fastToken, file string, sp *saveProgress) (e error)
 				return errStopUpload
 			}
 			parts = append(parts, part)
+			committed += chunk.Size
 		}
 	}
 	uploadingPart = false
