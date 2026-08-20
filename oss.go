@@ -46,10 +46,10 @@ var (
 )
 
 // Docker pull 风格的任务进度条模板，同一个文件的校验和上传阶段复用同一行。
-// 前缀为空时整行渲染为空白：校验阶段和小于 minBarSize 的文件就这样隐藏
-// 进行中：上传 file.mkv [================>              ] 45.20 MB/100.00 MB 12.50 MB/s ETA 45s
-// 已完成：上传 file.mkv 完成 1m23s
-const taskBarTemplate = `{{if string . "prefix"}}{{string . "prefix"}} {{if .IsFinished}}{{rtime . "" "完成 %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "…"}} {{rtime . "ETA %s" "" ""}}{{end}}{{end}}`
+// 已完成（进度走满或任务结束）时保留 100% 的进度条，像 docker 拉完镜像那样定格
+// 进行中：上传 file.mkv [=============>        ] 45.20 MB/100.00 MB 12.50 MB/s ETA 45s
+// 已完成：上传 file.mkv [=====================>] 100.00 MB/100.00 MB
+const taskBarTemplate = `{{if string . "prefix"}}{{string . "prefix"}} {{if or .IsFinished (ge .Current .Total)}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "…"}} {{rtime . "ETA %s" "" ""}}{{end}}{{end}}`
 
 // 小于此大小的文件不显示进度条，只在汇总中体现
 const minBarSize = 1 << 20
@@ -86,13 +86,15 @@ func stopBarPool() {
 
 // 每个上传任务固定占用一行进度条，校验和上传阶段复用同一行，
 // 避免上传大量文件时终端里的进度条行数无限增长。
-// 注意：任务进度条只能在该任务的所有文件都处理完后才能 Finish，
-// pb 库的池在所有进度条完成后的下一次刷新时会停止渲染且无法重启
+// 进度条在第一次显示内容（首个大文件的校验阶段）时才加入进度条池，
+// 只处理过小文件的任务不会产生空行。
+// 注意：任务进度条不能调用 Finish，pb 库的池在所有进度条完成后的
+// 下一次刷新时会停止渲染且无法重启，之后新加入的进度条将无法显示
 type taskBar struct {
 	bar *pb.ProgressBar
 }
 
-// 创建任务进度条并加入进度条池
+// 创建任务进度条
 // 进度条池未启动（stdout 不是终端）时返回 nil，所有方法都是安全的空操作
 func newTaskBar() *taskBar {
 	barMu.Lock()
@@ -102,15 +104,32 @@ func newTaskBar() *taskBar {
 	}
 	b := pb.New64(0).SetTemplate(taskBarTemplate).
 		Set(pb.Bytes, true).Set(pb.SIBytesPrefix, true).SetWriter(os.Stdout)
-	barPool.Add(b)
 	return &taskBar{bar: b}
 }
 
-// 开始新阶段：更新前缀、重置进度并重新计时，速度只统计当前阶段
+// 进度条是否已加入进度条池（池在加入进度条时会设置 Static 标志）
+func (t *taskBar) joined() bool {
+	return t != nil && t.bar != nil && t.bar.GetBool(pb.Static)
+}
+
+// 首次显示内容时把进度条加入进度条池开始渲染
+func (t *taskBar) joinPool() {
+	if t.joined() {
+		return
+	}
+	barMu.Lock()
+	defer barMu.Unlock()
+	if barPool != nil {
+		barPool.Add(t.bar)
+	}
+}
+
+// 开始新阶段：更新前缀、重置进度并重新计时，速度只统计当前阶段（校验或上传）
 func (t *taskBar) beginPhase(prefix string, total int64) {
 	if t == nil || t.bar == nil {
 		return
 	}
+	t.joinPool()
 	t.bar.SetTotal(total)
 	t.bar.SetCurrent(0)
 	t.bar.Set("prefix", truncatePrefix(prefix))
@@ -118,27 +137,14 @@ func (t *taskBar) beginPhase(prefix string, total int64) {
 	t.bar.Start()
 }
 
-// 开始校验阶段：校验是本地磁盘读取，很快，不显示进度，
-// 只清空该行避免残留上一个文件的上传进度
-func (t *taskBar) beginVerify() {
-	t.beginPhase("", 0)
-}
-
-// 开始上传阶段：小于 1MB 的文件不显示进度条，只在汇总中体现
+// 开始上传阶段：小于 1MB 的文件不显示进度条，只在汇总中体现。
+// 此时不能清空进度条，该行保持上一个文件完成时的 100% 显示，
+// 直到下一个大文件的校验或上传阶段自然覆盖它
 func (t *taskBar) beginUpload(filename string, total int64) {
-	prefix := ""
-	if total >= minBarSize {
-		prefix = "上传 " + filename
-	}
-	t.beginPhase(prefix, total)
-}
-
-// 结束任务进度条，该行固定显示完成状态和所用时间
-func (t *taskBar) finish() {
-	if t == nil || t.bar == nil {
+	if total < minBarSize {
 		return
 	}
-	t.bar.Finish()
+	t.beginPhase("上传 "+filename, total)
 }
 
 // 截断过长的进度条前缀，避免进度条行超过终端宽度导致换行错乱

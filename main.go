@@ -783,9 +783,9 @@ func main() {
 				}
 				file.uploadFile(ctx, tb)
 			}
-			if tb != nil {
-				tb.finish()
-			}
+			// 不调用进度条的 Finish：进度走满时模板已显示 100% 定格，
+			// 而 Finish 会让进度条池在所有任务完成后停止渲染，
+			// 之后其他任务新加入的进度条将无法显示
 		}()
 	}
 	wg.Wait()
