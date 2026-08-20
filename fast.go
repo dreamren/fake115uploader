@@ -202,7 +202,10 @@ func (file *fileInfo) fastUploadFile(tb *taskBar) (token *fastToken, e error) {
 		return nil, fmt.Errorf("解析 %s 的秒传响应出现错误：%w", file.Path, err)
 	}
 	if v.GetInt("status") == 2 && v.Exists("statuscode") && v.GetInt("statuscode") == 0 {
-		log.Printf("秒传模式上传 %s 成功", file.Path)
+		// 小于 1MB 的文件只在汇总中显示；大文件秒传成功值得单独提示（跳过了整个上传过程）
+		if info, serr := os.Stat(file.Path); serr == nil && info.Size() >= minBarSize {
+			log.Printf("秒传模式上传 %s 成功", file.Path)
+		}
 		if *removeFile {
 			if err = remove(file.Path); err != nil {
 				return nil, err

@@ -45,10 +45,14 @@ var (
 	barPool *pb.Pool
 )
 
-// Docker pull 风格的任务进度条模板，同一个文件的校验和上传阶段复用同一行
+// Docker pull 风格的任务进度条模板，同一个文件的校验和上传阶段复用同一行。
+// 前缀为空时整行渲染为空白：校验阶段和小于 minBarSize 的文件就这样隐藏
 // 进行中：上传 file.mkv [================>              ] 45.20 MB/100.00 MB 12.50 MB/s ETA 45s
 // 已完成：上传 file.mkv 完成 1m23s
-const taskBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}{{rtime . "" "完成 %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "…"}} {{rtime . "ETA %s" "" ""}}{{end}}`
+const taskBarTemplate = `{{if string . "prefix"}}{{string . "prefix"}} {{if .IsFinished}}{{rtime . "" "完成 %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "…"}} {{rtime . "ETA %s" "" ""}}{{end}}{{end}}`
+
+// 小于此大小的文件不显示进度条，只在汇总中体现
+const minBarSize = 1 << 20
 
 // 启动进度条池，在上传任务开始前调用
 func startBarPool() {
@@ -102,7 +106,7 @@ func newTaskBar() *taskBar {
 	return &taskBar{bar: b}
 }
 
-// 开始新阶段：更新前缀、重置进度并重新计时，速度只统计当前阶段（校验或上传）
+// 开始新阶段：更新前缀、重置进度并重新计时，速度只统计当前阶段
 func (t *taskBar) beginPhase(prefix string, total int64) {
 	if t == nil || t.bar == nil {
 		return
@@ -112,6 +116,21 @@ func (t *taskBar) beginPhase(prefix string, total int64) {
 	t.bar.Set("prefix", truncatePrefix(prefix))
 	// Start 会重置完成状态并重新计时；池内的 Static 进度条不会启动独立渲染协程
 	t.bar.Start()
+}
+
+// 开始校验阶段：校验是本地磁盘读取，很快，不显示进度，
+// 只清空该行避免残留上一个文件的上传进度
+func (t *taskBar) beginVerify() {
+	t.beginPhase("", 0)
+}
+
+// 开始上传阶段：小于 1MB 的文件不显示进度条，只在汇总中体现
+func (t *taskBar) beginUpload(filename string, total int64) {
+	prefix := ""
+	if total >= minBarSize {
+		prefix = "上传 " + filename
+	}
+	t.beginPhase(prefix, total)
 }
 
 // 结束任务进度条，该行固定显示完成状态和所用时间
@@ -441,8 +460,6 @@ func checkCallbackResult(callbackBody []byte, file string) error {
 
 // 利用 oss 的接口上传文件
 func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, tb *taskBar) (e error) {
-	log.Println("普通模式上传文件：" + file)
-
 	info, err := os.Stat(file)
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
@@ -456,7 +473,7 @@ func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID ui
 
 	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
-	tb.beginPhase("上传 "+filepath.Base(file), info.Size())
+	tb.beginUpload(filepath.Base(file), info.Size())
 	var uploadBar *pb.ProgressBar
 	if tb != nil {
 		uploadBar = tb.bar
@@ -477,7 +494,6 @@ func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID ui
 	if err = verifyUploaded(parentCID, filepath.Base(file), ft.SHA1); err != nil {
 		return err
 	}
-	log.Printf("普通模式上传 %s 成功", file)
 	if *removeFile {
 		if err = remove(file); err != nil {
 			return err
@@ -493,6 +509,5 @@ func remove(file string) error {
 	if err != nil {
 		return fmt.Errorf("删除原文件 %s 出现错误：%w", file, err)
 	}
-	log.Printf("成功删除原文件 %s", file)
 	return nil
 }

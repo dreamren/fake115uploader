@@ -130,15 +130,12 @@ func abortUpload(tm *ossTokenManager, imur oss.InitiateMultipartUploadResult, fi
 
 // 利用 oss 的接口以分片并行的方式上传文件
 func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, tb *taskBar) (e error) {
-	log.Println("分片模式上传文件：" + file)
-
 	info, err := os.Stat(file)
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
 	}
 	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 	if info.Size() <= 1024 {
-		log.Printf("%s 的大小小于1KB，改用普通模式上传", file)
 		return ossUploadFile(ctx, ft, file, parentCID, tb)
 	}
 	// 上传的文件大小不能超过 115GB
@@ -169,7 +166,7 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
 	}
 
-	tb.beginPhase("上传 "+filepath.Base(file), info.Size())
+	tb.beginUpload(filepath.Base(file), info.Size())
 	var uploadBar *pb.ProgressBar
 	if tb != nil {
 		uploadBar = tb.bar
@@ -245,7 +242,6 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	if err = verifyUploaded(parentCID, filepath.Base(file), ft.SHA1); err != nil {
 		return err
 	}
-	log.Printf("分片模式上传 %s 成功", file)
 	if *removeFile {
 		// Windows 不允许删除被占用的文件，先关闭文件句柄再删除
 		f.Close()

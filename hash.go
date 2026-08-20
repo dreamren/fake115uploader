@@ -45,17 +45,10 @@ func hashSHA1(f *os.File, tb *taskBar) (blockHash, totalHash string, e error) {
 	}
 
 	// 计算整个文件的 sha1 hash 值
-	// 大文件计算 hash 需要较长时间，显示校验进度避免看起来像卡住
-	info, serr := f.Stat()
+	// 校验是本地磁盘读取，很快，不显示进度，只清空进度条行避免残留上一个文件的显示
+	tb.beginVerify()
 	h := sha1.New()
-	var reader io.Reader = f
-	if serr == nil {
-		tb.beginPhase("校验 "+info.Name(), info.Size())
-		if tb != nil && tb.bar != nil {
-			reader = tb.bar.NewProxyReader(f)
-		}
-	}
-	if _, err = io.Copy(h, reader); err != nil {
+	if _, err = io.Copy(h, f); err != nil {
 		return "", "", fmt.Errorf("计算 %s 的 sha1 值出现错误：%w", f.Name(), err)
 	}
 	totalHash = strings.ToUpper(hex.EncodeToString(h.Sum(nil)))
