@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -303,19 +302,13 @@ func (m *ossTokenManager) autoRefresh() {
 	}
 }
 
-// 按文件名精确搜索验证文件是否上传成功
-func verifyUpload(parentCID uint64, filename, fileSHA1 string) (bool, error) {
-	reqURL, err := url.Parse(fmt.Sprintf(searchURL, parentCID))
+// 在目标文件夹的文件列表里按文件名精确查找文件，返回该文件在服务端的 SHA1
+// 使用文件夹列表接口而不是搜索接口，列表实时反映服务端状态，搜索索引对刚上传的文件有延迟
+func findUploadedFile(parentCID uint64, filename string) (sha string, found bool, e error) {
+	fileURL := fmt.Sprintf(listFileDirURL, parentCID)
+	v, err := getURLJSON(fileURL)
 	if err != nil {
-		return false, fmt.Errorf("解析搜索链接出现错误：%w", err)
-	}
-	query := reqURL.Query()
-	query.Set("search_value", filename)
-	reqURL.RawQuery = query.Encode()
-
-	v, err := getURLJSON(reqURL.String())
-	if err != nil {
-		return false, err
+		return "", false, err
 	}
 
 	for _, e := range v.GetArray("data") {
@@ -323,27 +316,39 @@ func verifyUpload(parentCID uint64, filename, fileSHA1 string) (bool, error) {
 		if !e.Exists("fid") {
 			continue
 		}
-		if string(e.GetStringBytes("n")) == filename && strings.ToUpper(string(e.GetStringBytes("sha"))) == fileSHA1 {
-			return true, nil
+		// 列表按时间降序排列，先找到的是最新上传的同名文件
+		if string(e.GetStringBytes("n")) == filename {
+			return strings.ToUpper(string(e.GetStringBytes("sha"))), true, nil
 		}
 	}
 
-	return false, nil
+	return "", false, nil
 }
 
-// 验证上传是否成功，服务端入库有延迟，共尝试 3 次
+// 验证上传是否成功，服务端入库有延迟，共尝试 5 次
 func verifyUploaded(parentCID uint64, filename, fileSHA1 string) error {
-	for i := 0; i < 3; i++ {
-		ok, err := verifyUpload(parentCID, filename, fileSHA1)
+	var lastSHA string
+	found := false
+	for i := 0; i < 5; i++ {
+		sha, ok, err := findUploadedFile(parentCID, filename)
 		if err != nil {
 			log.Printf("验证上传 %s 出现错误（第%d次尝试）：%v", filename, i+1, err)
 		} else if ok {
-			return nil
+			found = true
+			lastSHA = sha
+			if sha == fileSHA1 {
+				return nil
+			}
 		}
-		time.Sleep(2 * time.Second)
+		if i < 4 {
+			time.Sleep(2 * time.Second)
+		}
 	}
 
-	return fmt.Errorf("验证上传 %s 失败", filename)
+	if found {
+		return fmt.Errorf("验证上传 %s 失败：文件已上传但 SHA1 不匹配（服务端是 %s，本地是 %s）", filename, lastSHA, fileSHA1)
+	}
+	return fmt.Errorf("验证上传 %s 失败：目标文件夹里没有找到该文件", filename)
 }
 
 // 利用 oss 的接口上传文件
