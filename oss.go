@@ -351,6 +351,32 @@ func verifyUploaded(parentCID uint64, filename, fileSHA1 string) error {
 	return fmt.Errorf("验证上传 %s 失败：目标文件夹里没有找到该文件", filename)
 }
 
+// 解析 115 在 callback 里返回的响应，判断上传是否真正入库
+// OSS 返回 200 只说明 callback 的 HTTP 请求成功，115 可能在响应里返回业务错误
+func checkCallbackResult(callbackBody []byte, file string) error {
+	if len(callbackBody) == 0 {
+		return fmt.Errorf("完成 %s 的分片上传出现错误：115 没有返回 callback 响应（OSS 可能没有执行 callback）", file)
+	}
+	var p fastjson.Parser
+	v, err := p.ParseBytes(callbackBody)
+	if err != nil {
+		// callback 正常执行时 115 返回 JSON，响应不是 JSON 说明 OSS 可能没有执行 callback
+		// 此时响应是 CompleteMultipartUpload 的标准 XML 结果
+		return fmt.Errorf("完成 %s 的分片上传出现错误：callback 的响应不是 JSON（OSS 可能没有执行 callback），响应内容是：%s", file, string(callbackBody))
+	}
+	if v.Exists("state") && !v.GetBool("state") {
+		return fmt.Errorf("完成 %s 的分片上传出现错误：115 返回失败：%s", file, string(v.GetStringBytes("message")))
+	}
+	if msg := string(v.GetStringBytes("message")); msg != "" {
+		return fmt.Errorf("完成 %s 的分片上传出现错误：115 返回错误：%s", file, msg)
+	}
+	// 成功的响应里包含文件信息
+	if string(v.GetStringBytes("data", "file_id")) == "" {
+		return fmt.Errorf("完成 %s 的分片上传出现错误：115 的 callback 响应里缺少文件信息，响应内容是：%s", file, string(callbackBody))
+	}
+	return nil
+}
+
 // 利用 oss 的接口上传文件
 func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64) (e error) {
 	log.Println("普通模式上传文件：" + file)

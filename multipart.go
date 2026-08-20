@@ -251,6 +251,9 @@ dispatch:
 	callback := strings.ReplaceAll(ft.Callback.Callback, "${sha1}", ft.SHA1)
 	cb := base64.StdEncoding.EncodeToString([]byte(callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
+	if *verbose {
+		log.Printf("发送的 callback 的内容是：%s", callback)
+	}
 	var header http.Header
 	var callbackBody []byte
 	cmur, err := bucket.CompleteMultipartUpload(imur, parts,
@@ -272,6 +275,13 @@ dispatch:
 		log.Printf("CompleteMultipartUpload 的响应头的值是：\n%+v", header)
 		log.Printf("callback 的响应体的内容是：%s", callbackBody)
 		log.Printf("cmur 的值是：%+v", cmur)
+	}
+	// OSS 返回 200 不代表 115 入库成功，115 可能在 callback 响应里返回业务错误，
+	// 这里解析响应以及时发现入库失败的具体原因
+	if filename := filepath.Base(file); !strings.ContainsAny(filename, "&<") {
+		if err := checkCallbackResult(callbackBody, file); err != nil {
+			return err
+		}
 	}
 
 	// 验证上传是否成功
