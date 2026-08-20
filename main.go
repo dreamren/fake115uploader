@@ -54,7 +54,6 @@ var (
 	upload          *bool
 	multipartUpload *bool
 	configFile      *string
-	saveDir         *string
 	internal        *bool
 	removeFile      *bool
 	recursive       *bool
@@ -82,7 +81,7 @@ type uploadConfig struct {
 	HTTPRetry uint   `json:"httpRetry"` // HTTP 请求失败后的重试次数
 	HTTPProxy string `json:"httpProxy"` // HTTP 代理
 	OSSProxy  string `json:"ossProxy"`  // OSS 上传代理
-	PartsNum  uint   `json:"partsNum"`  // 断点续传的分片数量
+	PartsNum  uint   `json:"partsNum"`  // 分片上传的分片数量
 }
 
 // 上传失败的文件信息
@@ -95,7 +94,6 @@ type failedFile struct {
 type resultData struct {
 	Success []string     `json:"success"` // 上传成功的文件
 	Failed  []failedFile `json:"failed"`  // 上传失败的文件
-	Saved   []string     `json:"saved"`   // 保存上传进度的文件
 }
 
 // 要上传的文件的信息
@@ -203,7 +201,7 @@ func exitPrint() {
 		}
 	}()
 
-	if len(result.Success) == 0 && len(result.Failed) == 0 && len(result.Saved) == 0 {
+	if len(result.Success) == 0 && len(result.Failed) == 0 {
 		log.Println("本次运行没有上传文件")
 		return
 	}
@@ -224,10 +222,6 @@ func exitPrint() {
 	fmt.Printf("上传失败的文件（%d）：\n", len(result.Failed))
 	for _, f := range result.Failed {
 		fmt.Printf("  文件：%s，cid：%d\n", f.Path, f.CID)
-	}
-	fmt.Printf("保存上传进度的文件（%d）：\n", len(result.Saved))
-	for _, s := range result.Saved {
-		fmt.Println(s)
 	}
 }
 
@@ -424,9 +418,8 @@ func initialize() (e error) {
 
 	fastUpload = flag.Bool("f", false, "秒传模式上传`文件`")
 	upload = flag.Bool("u", false, "先尝试用秒传模式上传`文件`，失败后改用普通模式上传")
-	multipartUpload = flag.Bool("m", false, "先尝试用秒传模式上传`文件`，失败后改用断点续传模式上传，可以随时中断上传再重启上传（适合用于上传超大文件，注意暂停上传的时间不要太长）")
+	multipartUpload = flag.Bool("m", false, "先尝试用秒传模式上传`文件`，失败后改用分片模式上传（适合用于上传超大文件）")
 	configFile = flag.String("l", "", "指定设置`文件`（json 格式），默认是程序所在的文件夹里的 fake115uploader.json")
-	saveDir = flag.String("d", "", "指定存放断点续传存档文件的`文件夹`，默认是程序所在的文件夹")
 	cookies := flag.String("k", "", "使用指定的 115 的`Cookie`")
 	cid := flag.Uint64("c", 1, "上传文件到指定的 115 文件夹，`cid`为 115 里的文件夹对应的 cid(默认为 0，即根目录）")
 	resultDir := flag.String("r", "", "将上传结果保存在指定`文件夹`")
@@ -437,7 +430,7 @@ func initialize() (e error) {
 	ossProxy := flag.String("oss-proxy", "", "指定 OSS 上传使用的`代理`")
 	httpRetry := flag.Uint("http-retry", 0, "HTTP 请求失败后的`重试次数`，默认为 0（即不重试）")
 	recursive = flag.Bool("recursive", false, "递归上传文件夹")
-	partsNum := flag.Uint("parts-num", 0, "断点续传模式上传文件的`分片数量`，范围为 1 到 10000，默认为 0（即自动分片）")
+	partsNum := flag.Uint("parts-num", 0, "分片模式上传文件的`分片数量`，范围为 1 到 10000，默认为 0（即自动分片）")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")
 
@@ -447,12 +440,6 @@ func initialize() (e error) {
 		path, err := os.Executable()
 		checkErr(err)
 		*configFile = filepath.Join(filepath.Dir(path), "fake115uploader.json")
-	}
-
-	if *saveDir == "" {
-		path, err := os.Executable()
-		checkErr(err)
-		*saveDir = filepath.Dir(path)
 	}
 
 	if !*noConfig {
@@ -475,7 +462,7 @@ func initialize() (e error) {
 	}
 
 	if *partsNum != 0 && !*multipartUpload {
-		log.Println("-parts-num 参数只支持断点续传模式")
+		log.Println("-parts-num 参数只支持分片上传模式")
 		os.Exit(1)
 	}
 	// 优先使用参数指定的分片数量
@@ -700,19 +687,21 @@ func main() {
 	}
 
 	for _, file := range files {
-		file.uploadFile()
+		if !file.uploadFile() {
+			break
+		}
 	}
 }
 
-// 上传文件
-func (file *fileInfo) uploadFile() {
+// 上传文件，返回 false 表示用户按 q 键要求停止上传
+func (file *fileInfo) uploadFile() bool {
 	switch {
 	case *fastUpload:
 		_, err := file.fastUploadFile()
 		if err != nil {
 			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
 			result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-			return
+			return true
 		}
 		result.Success = append(result.Success, file.Path)
 	case *upload:
@@ -724,47 +713,27 @@ func (file *fileInfo) uploadFile() {
 			if err != nil {
 				log.Printf("普通模式上传 %s 出现错误：%v", file.Path, err)
 				result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-				return
+				return true
 			}
 		}
 		result.Success = append(result.Success, file.Path)
 	case *multipartUpload:
-		// 存档文件保存在设置文件所在文件夹内
-		saveFile := filepath.Join(*saveDir, filepath.Base(file.Path)+".json")
-		info, err := os.Stat(saveFile)
-		if os.IsNotExist(err) {
-			token, err := file.fastUploadFile()
-			if err != nil {
-				log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
-				log.Println("现在开始使用断点续传模式上传")
-				err := multipartUploadFile(token, file.Path, nil)
-				if err != nil {
-					if errors.Is(err, errStopUpload) {
-						return
-					}
-					log.Printf("断点续传模式上传 %s 出现错误：%v", file.Path, err)
-					result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-					return
-				}
-			}
-			result.Success = append(result.Success, file.Path)
-		} else {
-			if info.IsDir() {
-				log.Printf("%s 不能是文件夹", saveFile)
-				result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-				return
-			}
-			log.Printf("发现文件 %s 的上传曾经中断过，现在开始断点续传", file.Path)
-			err := resumeUpload(file.Path)
+		token, err := file.fastUploadFile()
+		if err != nil {
+			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
+			log.Println("现在开始使用分片模式上传")
+			err := multipartUploadFile(token, file.Path)
 			if err != nil {
 				if errors.Is(err, errStopUpload) {
-					return
+					return false
 				}
-				log.Printf("断点续传模式上传 %s 出现错误：%v", file.Path, err)
+				log.Printf("分片模式上传 %s 出现错误：%v", file.Path, err)
 				result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-				return
+				return true
 			}
-			result.Success = append(result.Success, file.Path)
 		}
+		result.Success = append(result.Success, file.Path)
 	}
+
+	return true
 }
