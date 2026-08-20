@@ -147,10 +147,11 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	}
 
 	ot, bucket := tm.get()
+	// 不能设置 oss.Sequential()，该参数要求分片必须按序号顺序上传，
+	// 与分片并行上传冲突，会导致 OSS 返回 PartNotSequential 错误
 	imur, err := bucket.InitiateMultipartUpload(ft.Object,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.UserAgentHeader(aliUserAgent),
-		oss.Sequential(),
 	)
 	if err != nil {
 		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
