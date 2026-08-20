@@ -43,27 +43,16 @@ var (
 	// 进度条池，程序启动后只创建一次
 	barMu   sync.Mutex
 	barPool *pb.Pool
-
-	// 总进度条：显示已处理完成的文件数（成功 + 失败）。
-	// 它还有保活作用：pb 库的池在所有进度条完成后的下一次刷新时会停止渲染且无法重启，
-	// 总进度条在上传结束前不会完成，保证池的渲染协程全程存活
-	aggBar = pb.New64(0).SetTemplate(aggBarTemplate).Set("prefix", "总计").SetWriter(os.Stdout)
 )
 
-// Docker pull 风格的任务进度条模板
+// Docker pull 风格的任务进度条模板，同一个文件的校验和上传阶段复用同一行
 // 进行中：上传 file.mkv [================>              ] 45.20 MB/100.00 MB 12.50 MB/s ETA 45s
-// 已完成：file.mkv 完成 1m23s（失败时显示红色的"失败"）
-const taskBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}{{if eq (string . "result") "失败"}}{{red (string . "result")}}{{else}}{{green (string . "result")}}{{end}}{{rtime . "" " %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "0B/s"}} {{rtime . "ETA %s" "" ""}}{{end}}`
+// 已完成：上传 file.mkv 完成 1m23s
+const taskBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}{{rtime . "" "完成 %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "…"}} {{rtime . "ETA %s" "" ""}}{{end}}`
 
-// 总进度条模板
-// 进行中：总计 [=========>     ] 3/500
-// 已完成：总计 全部完成 12m3s
-const aggBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}全部完成 {{rtime . "" "%s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}}{{end}}`
-
-// 启动进度条池和总进度条，在上传任务开始前调用
-func startBarPool(totalFiles int) {
-	aggBar.SetTotal(int64(totalFiles))
-	if !stdoutIsTTY || totalFiles <= 0 {
+// 启动进度条池，在上传任务开始前调用
+func startBarPool() {
+	if !stdoutIsTTY {
 		return
 	}
 
@@ -76,9 +65,7 @@ func startBarPool(totalFiles int) {
 	if err := barPool.Start(); err != nil {
 		log.Printf("启动进度条池出现错误：%v", err)
 		barPool = nil
-		return
 	}
-	barPool.Add(aggBar)
 }
 
 // 停止进度条池。必须在上传任务全部结束后、打印上传结果汇总前调用，
@@ -89,13 +76,14 @@ func stopBarPool() {
 	if barPool == nil {
 		return
 	}
-	aggBar.Finish()
 	barPool.Stop()
 	barPool = nil
 }
 
 // 每个上传任务固定占用一行进度条，校验和上传阶段复用同一行，
-// 避免上传大量文件时终端里的进度条行数无限增长
+// 避免上传大量文件时终端里的进度条行数无限增长。
+// 注意：任务进度条只能在该任务的所有文件都处理完后才能 Finish，
+// pb 库的池在所有进度条完成后的下一次刷新时会停止渲染且无法重启
 type taskBar struct {
 	bar *pb.ProgressBar
 }
@@ -121,27 +109,12 @@ func (t *taskBar) beginPhase(prefix string, total int64) {
 	}
 	t.bar.SetTotal(total)
 	t.bar.SetCurrent(0)
-	t.bar.Set("prefix", prefix)
-	t.bar.Set("result", "")
+	t.bar.Set("prefix", truncatePrefix(prefix))
 	// Start 会重置完成状态并重新计时；池内的 Static 进度条不会启动独立渲染协程
 	t.bar.Start()
 }
 
-// 标记任务完成，该行固定显示最终结果，类似 docker 的 Pull complete
-func (t *taskBar) done(filename string, ok bool) {
-	if t == nil || t.bar == nil {
-		return
-	}
-	t.bar.Set("prefix", filename)
-	if ok {
-		t.bar.Set("result", "完成")
-	} else {
-		t.bar.Set("result", "失败")
-	}
-	t.bar.Finish()
-}
-
-// 结束任务进度条
+// 结束任务进度条，该行固定显示完成状态和所用时间
 func (t *taskBar) finish() {
 	if t == nil || t.bar == nil {
 		return
@@ -149,12 +122,23 @@ func (t *taskBar) finish() {
 	t.bar.Finish()
 }
 
+// 截断过长的进度条前缀，避免进度条行超过终端宽度导致换行错乱
+func truncatePrefix(s string) string {
+	const max = 30
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
 // 进度监听
 type ossProgressListener struct {
 	bar *pb.ProgressBar
 }
 
-// 实现 oss.ProgressListener 的接口
+// 实现 oss.ProgressListener 的接口。
+// 注意不能在这里调用 Finish，进度条的生命周期由任务统一管理
 func (listener *ossProgressListener) ProgressChanged(event *oss.ProgressEvent) {
 	if listener == nil || listener.bar == nil {
 		return
@@ -162,8 +146,6 @@ func (listener *ossProgressListener) ProgressChanged(event *oss.ProgressEvent) {
 	switch event.EventType {
 	case oss.TransferDataEvent:
 		listener.bar.SetCurrent(event.ConsumedBytes)
-	case oss.TransferCompletedEvent, oss.TransferFailedEvent:
-		listener.bar.Finish()
 	default:
 	}
 }
@@ -489,7 +471,6 @@ func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID ui
 
 	err = bucket.PutObjectFromFile(ft.Object, file, options...)
 	if err != nil {
-		tb.finish()
 		return fmt.Errorf("普通模式上传 %s 出现错误：%w", file, err)
 	}
 

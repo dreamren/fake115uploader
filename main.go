@@ -190,7 +190,6 @@ func recordSuccess(path string) {
 	resultMu.Lock()
 	result.Success = append(result.Success, path)
 	resultMu.Unlock()
-	aggBar.Increment()
 }
 
 // 记录上传失败的文件
@@ -198,7 +197,6 @@ func recordFailed(path string, cid uint64) {
 	resultMu.Lock()
 	result.Failed = append(result.Failed, failedFile{Path: path, CID: cid})
 	resultMu.Unlock()
-	aggBar.Increment()
 }
 
 // 程序退出时打印信息
@@ -760,8 +758,8 @@ func main() {
 	// 多个任务并行上传，每个任务固定占用一行进度条
 	if len(files) > 0 {
 		fmt.Println("按 q 键停止上传并退出程序")
+		startBarPool()
 	}
-	startBarPool(len(files))
 	tasks := make(chan fileInfo)
 	var wg sync.WaitGroup
 	go func() {
