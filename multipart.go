@@ -249,9 +249,10 @@ dispatch:
 	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
 	var header http.Header
+	// 并行分片模式下 OSS 不支持 x-oss-hash-sha1 校验头（会返回 Sha1CheckNotSupport 错误），
+	// 上传是否成功由上传完成后的 verifyUploaded 按文件名和 SHA1 到 115 服务端验证
 	cmur, err := bucket.CompleteMultipartUpload(imur, parts,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
-		oss.SetHeader("x-oss-hash-sha1", ft.SHA1),
 		oss.Callback(cb),
 		oss.CallbackVar(cbVar),
 		oss.UserAgentHeader(aliUserAgent),
