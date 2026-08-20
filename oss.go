@@ -34,42 +34,73 @@ type ossToken struct {
 	endpoint        string
 }
 
-// 进度条池，支持多个上传任务同时显示进度条
 var (
-	barPool     = pb.NewPool()
-	barPoolOnce sync.Once
-	useBarPool  bool
 	stdoutIsTTY = func() bool {
 		info, err := os.Stdout.Stat()
 		return err == nil && info.Mode()&os.ModeCharDevice != 0
 	}()
+
+	// 进度条池管理：pb.Pool 在所有进度条完成后的下一次刷新时会停止渲染且无法重启，
+	// 多文件依次上传时后面的文件就没有进度条了，因此检测到全部完成后换用新的池
+	barMu       sync.Mutex
+	curPool     *pb.Pool           // 当前正在渲染的进度条池
+	curPoolBars []*pb.ProgressBar  // 已加入当前池的进度条
 )
+
+// 等待旧池完成最后一次渲染的时间，略大于 pb 库的默认刷新间隔（200ms）
+const barSwitchDelay = 250 * time.Millisecond
 
 // 创建带文件名前缀的进度条
 // 进度条统一输出到 stdout，日志输出到 stderr，避免两者在终端里互相覆盖截断
 func newBar(total int64, prefix string) *pb.ProgressBar {
 	b := pb.New64(total).SetTemplate(pb.Full).Set(pb.Bytes, true).Set("prefix", prefix).SetWriter(os.Stdout)
-	if stdoutIsTTY {
-		barPoolOnce.Do(func() {
-			if err := barPool.Start(); err == nil {
-				useBarPool = true
-			} else {
-				log.Printf("启动进度条池出现错误：%v", err)
-			}
-		})
-		if useBarPool {
-			barPool.Add(b)
+	if !stdoutIsTTY {
+		b.Start()
+		return b
+	}
+
+	barMu.Lock()
+	defer barMu.Unlock()
+
+	// 所有进度条都已完成时，池已停止渲染（或即将停止），换用新池
+	if curPool != nil && allBarsFinished() {
+		// 等待渲染循环把已完成进度条的最终状态渲染出来再停止
+		time.Sleep(barSwitchDelay)
+		curPool.Stop()
+		curPool = nil
+		curPoolBars = nil
+	}
+	if curPool == nil {
+		curPool = pb.NewPool()
+		if err := curPool.Start(); err != nil {
+			log.Printf("启动进度条池出现错误：%v", err)
+			curPool = nil
+			b.Start() // 退化为单进度条独立渲染
 			return b
 		}
 	}
-	b.Start()
+	curPool.Add(b)
+	curPoolBars = append(curPoolBars, b)
 	return b
+}
+
+// 判断当前池里的进度条是否全部完成
+func allBarsFinished() bool {
+	for _, b := range curPoolBars {
+		if !b.IsFinished() {
+			return false
+		}
+	}
+	return true
 }
 
 // 停止进度条池
 func stopBarPool() {
-	if useBarPool {
-		barPool.Stop()
+	barMu.Lock()
+	defer barMu.Unlock()
+	if curPool != nil {
+		curPool.Stop()
+		curPool = nil
 	}
 }
 
