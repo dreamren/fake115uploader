@@ -46,8 +46,9 @@ var (
 )
 
 // 创建带文件名前缀的进度条
+// 进度条统一输出到 stdout，日志输出到 stderr，避免两者在终端里互相覆盖截断
 func newBar(total int64, prefix string) *pb.ProgressBar {
-	b := pb.New64(total).SetTemplate(pb.Full).Set(pb.Bytes, true).Set("prefix", prefix)
+	b := pb.New64(total).SetTemplate(pb.Full).Set(pb.Bytes, true).Set("prefix", prefix).SetWriter(os.Stdout)
 	if stdoutIsTTY {
 		barPoolOnce.Do(func() {
 			if err := barPool.Start(); err == nil {

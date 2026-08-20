@@ -445,10 +445,22 @@ func initialize() (e error) {
 	partSize := flag.Int("part-size", 0, "分片模式上传文件的`分片大小`，单位为 MB，范围为 1 到 5120，默认为 0（即 128MB）")
 	parallelParts := flag.Int("parallel-parts", 0, "已无效：115 要求分片按序上传，分片无法并行，请用 -concurrent-uploads 提升速度")
 	concurrentUploads := flag.Int("concurrent-uploads", 0, "同时上传的最大`任务数`，范围为 1 到 10，默认为 0（即 2）")
+	logFile := flag.String("log-file", "", "将日志保存到指定`文件`（推荐：进度条会截断终端日志，日志文件里的内容才是完整的）")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")
 
 	flag.Parse()
+
+	// 终端里进度条的重绘会截断日志行，把日志写入文件以保证内容完整
+	if *logFile != "" {
+		lf, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("打开日志文件 %s 出现错误：%v", *logFile, err)
+		}
+		defer lf.Close()
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+		log.Printf("日志同时保存到 %s", *logFile)
+	}
 
 	if *configFile == "" {
 		path, err := os.Executable()

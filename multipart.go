@@ -234,6 +234,9 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	}
 	log.Printf("分片模式上传 %s 成功", file)
 	if *removeFile {
+		// Windows 不允许删除被占用的文件，先关闭文件句柄和进度条再删除
+		f.Close()
+		bar.Finish()
 		if err = remove(file); err != nil {
 			return err
 		}
