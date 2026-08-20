@@ -246,17 +246,20 @@ dispatch:
 	}
 
 	ot, bucket = tm.get()
-	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
+	// 并行分片模式下 115 定制的 OSS 不会计算整个文件的 SHA1，callback 里的 ${sha1}
+	// 占位符必须由客户端替换为本地计算的文件 SHA1，否则 115 服务端收不到 SHA1 会拒绝入库
+	callback := strings.ReplaceAll(ft.Callback.Callback, "${sha1}", ft.SHA1)
+	cb := base64.StdEncoding.EncodeToString([]byte(callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
 	var header http.Header
-	// 并行分片模式下 OSS 不支持 x-oss-hash-sha1 校验头（会返回 Sha1CheckNotSupport 错误），
-	// 上传是否成功由上传完成后的 verifyUploaded 按文件名和 SHA1 到 115 服务端验证
+	var callbackBody []byte
 	cmur, err := bucket.CompleteMultipartUpload(imur, parts,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.Callback(cb),
 		oss.CallbackVar(cbVar),
 		oss.UserAgentHeader(aliUserAgent),
 		oss.GetResponseHeader(&header),
+		oss.CallbackResult(&callbackBody),
 	)
 	// EOF 错误是 xml 的 Unmarshal 导致的，响应其实是 json 格式，所以实际上上传是成功的
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -267,6 +270,7 @@ dispatch:
 	}
 	if *verbose {
 		log.Printf("CompleteMultipartUpload 的响应头的值是：\n%+v", header)
+		log.Printf("callback 的响应体的内容是：%s", callbackBody)
 		log.Printf("cmur 的值是：%+v", cmur)
 	}
 
