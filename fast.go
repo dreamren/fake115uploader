@@ -52,12 +52,6 @@ const md5Salt = "Qclm8MGWUv59TnrR0XPg"
 
 // 上传 SHA1 的值到 115
 func uploadSHA1(filename, fileSize, totalHash, signKey, signVal string, targetCID uint64) (body []byte, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("uploadSHA1() error: %v", err)
-		}
-	}()
-
 	fileID := strings.ToUpper(totalHash)
 	target := targetPrefix + strconv.FormatUint(targetCID, 10)
 	data := sha1.Sum([]byte(userID + fileID + target + "0"))
@@ -73,7 +67,9 @@ func uploadSHA1(filename, fileSize, totalHash, signKey, signVal string, targetCI
 	token := hex.EncodeToString(tokenMd5[:])
 
 	encodedToken, err := ecdhCipher.EncodeToken(t)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("加密 token 出现错误：%w", err)
+	}
 
 	uploadURL := fmt.Sprintf(initURL, encodedToken)
 
@@ -101,18 +97,26 @@ func uploadSHA1(filename, fileSize, totalHash, signKey, signVal string, targetCI
 	}
 
 	encrypted, err := ecdhCipher.Encrypt([]byte(form.Encode()))
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("加密上传请求出现错误：%w", err)
+	}
 
 	req, err := http.NewRequest(http.MethodPost, uploadURL, bytes.NewReader(encrypted))
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("构造 initupload 请求出现错误：%w", err)
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Cookie", config.Cookies)
 	resp, err := doRequest(req)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	body, err = io.ReadAll(resp.Body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("读取 initupload 的响应出现错误：%w", err)
+	}
 	decrypted, err := ecdhCipher.Decrypt(body)
 	if err != nil {
 		if *verbose {
@@ -127,31 +131,35 @@ func uploadSHA1(filename, fileSize, totalHash, signKey, signVal string, targetCI
 
 // 利用文件的 sha1 hash 值上传文件获取响应
 func (file *fileInfo) uploadFileSHA1() (body []byte, fileSHA1 string, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("uploadFileSHA1() error: %v", err)
-		}
-	}()
-
 	f, err := os.Open(file.Path)
-	checkErr(err)
+	if err != nil {
+		return nil, "", fmt.Errorf("打开 %s 出现错误：%w", file.Path, err)
+	}
 	defer f.Close()
 
 	_, totalHash, err := hashSHA1(f)
-	checkErr(err)
+	if err != nil {
+		return nil, "", err
+	}
 
 	info, err := os.Stat(file.Path)
-	checkErr(err)
+	if err != nil {
+		return nil, "", fmt.Errorf("获取 %s 的信息出现错误：%w", file.Path, err)
+	}
 	filename := info.Name()
 	fileSize := strconv.FormatInt(info.Size(), 10)
 	targetCID := file.ParentID
 
 	body, err = uploadSHA1(filename, fileSize, totalHash, "", "", targetCID)
-	checkErr(err)
+	if err != nil {
+		return nil, "", err
+	}
 
 	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
-	checkErr(err)
+	if err != nil {
+		return nil, "", fmt.Errorf("解析 %s 的秒传响应出现错误：%w", file.Path, err)
+	}
 	if v.GetInt("status") == 7 && v.GetInt("statuscode") == 701 {
 		if *verbose {
 			log.Printf("秒传模式上传文件 %s 的响应体的内容是：\n%s", file.Path, string(body))
@@ -160,28 +168,28 @@ func (file *fileInfo) uploadFileSHA1() (body []byte, fileSHA1 string, e error) {
 		signKey := string(v.GetStringBytes("sign_key"))
 		signCheck := string(v.GetStringBytes("sign_check"))
 		signVal, err := hashFileRange(f, signCheck)
-		checkErr(err)
+		if err != nil {
+			return nil, "", err
+		}
 
 		body, err = uploadSHA1(filename, fileSize, totalHash, signKey, signVal, targetCID)
-		checkErr(err)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 
 	return body, totalHash, nil
 }
 
-// 以秒传模式上传文件
+// 以秒传模式上传文件，秒传失败时返回的 token 供普通模式和分片模式使用
 func (file *fileInfo) fastUploadFile() (token *fastToken, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("fastUploadFile() error: %v", err)
-		}
-	}()
-
 	token = new(fastToken)
 	log.Println("秒传模式上传文件：" + file.Path)
 
 	body, fileSHA1, err := file.uploadFileSHA1()
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	token.SHA1 = fileSHA1
 
 	if *verbose {
@@ -190,17 +198,21 @@ func (file *fileInfo) fastUploadFile() (token *fastToken, e error) {
 
 	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("解析 %s 的秒传响应出现错误：%w", file.Path, err)
+	}
 	if v.GetInt("status") == 2 && v.Exists("statuscode") && v.GetInt("statuscode") == 0 {
 		log.Printf("秒传模式上传 %s 成功", file.Path)
 		if *removeFile {
-			err = remove(file.Path)
-			checkErr(err)
+			if err = remove(file.Path); err != nil {
+				return nil, err
+			}
 		}
 	} else if v.GetInt("status") == 1 && v.Exists("statuscode") && v.GetInt("statuscode") == 0 {
-		// 秒传失败的响应包含普通上传模式和断点续传模式的 token
-		err = json.Unmarshal(body, &token)
-		checkErr(err)
+		// 秒传失败的响应包含普通上传模式和分片上传模式的 token
+		if err = json.Unmarshal(body, &token); err != nil {
+			return nil, fmt.Errorf("解析 %s 的秒传响应出现错误：%w", file.Path, err)
+		}
 
 		if *verbose {
 			log.Printf("秒传模式上传 %s 失败返回的内容是：\n%+v", file.Path, token)
@@ -208,7 +220,7 @@ func (file *fileInfo) fastUploadFile() (token *fastToken, e error) {
 
 		return token, fmt.Errorf("秒传模式上传 %s 失败", file.Path)
 	} else {
-		panic(fmt.Errorf("秒传模式上传 %s 失败", file.Path))
+		return nil, fmt.Errorf("秒传模式上传 %s 失败", file.Path)
 	}
 
 	return token, nil

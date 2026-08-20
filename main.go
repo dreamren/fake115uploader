@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,7 +34,6 @@ const (
 	infoURL        = "https://proapi.115.com/app/uploadinfo"
 	initURL        = "https://uplb.115.com/4.0/initupload.php?k_ec=%s"
 	getinfoURL     = "https://uplb.115.com/3.0/getuploadinfo.php"
-	listFileURL    = "https://webapi.115.com/files?aid=1&cid=%d&o=user_ptime&asc=0&offset=0&show_dir=0&limit=%d&natsort=1&format=json"
 	listFileDirURL = "https://webapi.115.com/files?aid=1&cid=%d&o=user_ptime&asc=0&offset=0&show_dir=1&limit=100000&natsort=1&format=json"
 	downloadURL    = "https://proapi.115.com/app/chrome/downurl"
 	orderURL       = "https://webapi.115.com/files/order"
@@ -62,10 +61,8 @@ var (
 	userKey         string
 	config          uploadConfig // 设置数据
 	result          resultData   // 上传结果
-	uploadingPart   bool
-	errStopUpload   = errors.New("暂停上传")
+	resultMu        sync.Mutex   // 保护 result 的并发读写
 	quit            = make(chan struct{})
-	multipartCh     = make(chan struct{})
 	proxyHost       string
 	proxyUser       string
 	proxyPassword   string
@@ -75,13 +72,16 @@ var (
 
 // 设置数据
 type uploadConfig struct {
-	Cookies   string `json:"cookies"`   // 115 网页版的 Cookie
-	CID       uint64 `json:"cid"`       // 115 里文件夹的 cid
-	ResultDir string `json:"resultDir"` // 在指定文件夹保存上传结果
-	HTTPRetry uint   `json:"httpRetry"` // HTTP 请求失败后的重试次数
-	HTTPProxy string `json:"httpProxy"` // HTTP 代理
-	OSSProxy  string `json:"ossProxy"`  // OSS 上传代理
-	PartsNum  uint   `json:"partsNum"`  // 分片上传的分片数量
+	Cookies           string `json:"cookies"`           // 115 网页版的 Cookie
+	CID               uint64 `json:"cid"`               // 115 里文件夹的 cid
+	ResultDir         string `json:"resultDir"`         // 在指定文件夹保存上传结果
+	HTTPRetry         uint   `json:"httpRetry"`         // HTTP 请求失败后的重试次数
+	HTTPProxy         string `json:"httpProxy"`         // HTTP 代理
+	OSSProxy          string `json:"ossProxy"`          // OSS 上传代理
+	PartsNum          uint   `json:"partsNum"`          // 分片上传的分片数量
+	PartSizeMB        int    `json:"partSizeMB"`        // 分片上传的分片大小（MB）
+	ParallelParts     int    `json:"parallelParts"`     // 分片上传时每个文件的并行分片数
+	ConcurrentUploads int    `json:"concurrentUploads"` // 同时上传的任务数
 }
 
 // 上传失败的文件信息
@@ -133,7 +133,11 @@ func getInput(ctx context.Context) {
 		case event := <-eventCh:
 			checkErr(event.Err)
 			if string(event.Rune) == "q" || string(event.Rune) == "Q" || event.Key == keyboard.KeyCtrlC {
-				quit <- struct{}{}
+				// 通知退出信号，接收方可能已退出，不阻塞
+				select {
+				case quit <- struct{}{}:
+				default:
+				}
 				return
 			}
 		}
@@ -162,32 +166,37 @@ func closeKeybord() {
 	}
 }
 
-// 退出处理
-func handleQuit() {
+// 监听退出信号（q 键或系统信号），取消 context 停止所有上传任务
+func watchStop(ctx context.Context, cancel context.CancelFunc) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
 	select {
-	case <-ch:
-	case <-quit:
+	case <-quit: // q 键
+	case <-ch: // 系统信号
+	case <-ctx.Done():
+		return
 	}
 
 	signal.Stop(ch)
 	signal.Reset(os.Interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-	log.Println("收到退出信号，正在退出本程序，请等待")
+	log.Println("收到退出信号，正在停止上传任务，请等待")
+	cancel()
+}
 
-	if uploadingPart {
-		multipartCh <- struct{}{}
-		<-multipartCh
-	}
+// 记录上传成功的文件
+func recordSuccess(path string) {
+	resultMu.Lock()
+	result.Success = append(result.Success, path)
+	resultMu.Unlock()
+}
 
-	closeKeybord()
-	exitPrint()
-	if len(result.Failed) != 0 {
-		os.Exit(1)
-	}
-	os.Exit(0)
+// 记录上传失败的文件
+func recordFailed(path string, cid uint64) {
+	resultMu.Lock()
+	result.Failed = append(result.Failed, failedFile{Path: path, CID: cid})
+	resultMu.Unlock()
 }
 
 // 程序退出时打印信息
@@ -285,8 +294,7 @@ func getUserKey() (e error) {
 
 // 根据文件夹名字查找文件夹
 func findDir(v *fastjson.Value, pid uint64, name string) (cid uint64, e error) {
-	list := v.GetArray("data")
-	for _, v := range list {
+	for _, v := range v.GetArray("data") {
 		if v.Exists("fid") {
 			continue
 		}
@@ -313,21 +321,19 @@ func findDir(v *fastjson.Value, pid uint64, name string) (cid uint64, e error) {
 
 // 在 115 网盘指定文件夹里创建新文件夹
 func createDir(pid uint64, name string) (cid uint64, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("createDir() error: %v", err)
-		}
-	}()
-
 	form := url.Values{}
 	form.Set("pid", strconv.FormatUint(pid, 10))
 	form.Set("cname", name)
 	v, err := postFormJSON(createDirURL, form.Encode())
-	checkErr(err)
+	if err != nil {
+		return 0, fmt.Errorf("创建文件夹 %s 出现错误：%w", name, err)
+	}
 
 	if v.GetBool("state") {
 		cid, err = strconv.ParseUint(string(v.GetStringBytes("cid")), 10, 64)
-		checkErr(err)
+		if err != nil {
+			return 0, fmt.Errorf("解析文件夹 %s 的 cid 出现错误：%v", name, err)
+		}
 		if *verbose {
 			log.Printf("成功创建文件夹 %s ，cid：%d", name, cid)
 		}
@@ -338,28 +344,30 @@ func createDir(pid uint64, name string) (cid uint64, e error) {
 	// 要创建的文件夹已经存在
 	if v.GetInt("errno") == 20004 {
 		reqURL, err := url.Parse(fmt.Sprintf(searchURL, pid))
-		checkErr(err)
+		if err != nil {
+			return 0, fmt.Errorf("解析搜索链接出现错误：%w", err)
+		}
 		query := reqURL.Query()
 		query.Set("search_value", name)
 		reqURL.RawQuery = query.Encode()
-		v, err := getURLJSON(reqURL.String())
 		// 请求有可能返回空 body
-		if err == nil {
-			cid, err = findDir(v, pid, name)
-			if err == nil {
+		if sv, err := getURLJSON(reqURL.String()); err == nil {
+			if cid, err := findDir(sv, pid, name); err == nil {
 				return cid, nil
+			} else if *verbose {
+				log.Printf("搜索文件夹失败，改为直接查找文件夹：%v", err)
 			}
-		}
-		if *verbose {
+		} else if *verbose {
 			log.Printf("搜索文件夹失败，改为直接查找文件夹：%v", err)
 		}
 
 		// 如果搜索的文件夹不存在，就直接查找
 		fileURL := fmt.Sprintf(listFileDirURL, pid)
 		v, err = getURLJSON(fileURL)
-		checkErr(err)
-		cid, err = findDir(v, pid, name)
-		if err == nil {
+		if err != nil {
+			return 0, fmt.Errorf("创建文件夹 %s 出现错误：%w", name, err)
+		}
+		if cid, err = findDir(v, pid, name); err == nil {
 			return cid, nil
 		}
 	}
@@ -371,9 +379,12 @@ func createDir(pid uint64, name string) (cid uint64, e error) {
 func orderFile(cid uint64) {
 	orderBody := fmt.Sprintf("user_order=user_ptime&file_id=%d&user_asc=0&fc_mix=0", cid)
 	v, err := postFormJSON(orderURL, orderBody)
-	checkErr(err)
+	if err != nil {
+		log.Printf("排序文件夹 %d 出现错误：%v", cid, err)
+		return
+	}
 	if !v.GetBool("state") {
-		panic(fmt.Sprintf("排序文件夹 %d 出现错误：%v", cid, v.GetStringBytes("error")))
+		log.Printf("排序文件夹 %d 出现错误：%s", cid, v.GetStringBytes("error"))
 	} else if *verbose {
 		log.Printf("排序文件夹 %d 成功", cid)
 	}
@@ -430,7 +441,10 @@ func initialize() (e error) {
 	ossProxy := flag.String("oss-proxy", "", "指定 OSS 上传使用的`代理`")
 	httpRetry := flag.Uint("http-retry", 0, "HTTP 请求失败后的`重试次数`，默认为 0（即不重试）")
 	recursive = flag.Bool("recursive", false, "递归上传文件夹")
-	partsNum := flag.Uint("parts-num", 0, "分片模式上传文件的`分片数量`，范围为 1 到 10000，默认为 0（即自动分片）")
+	partsNum := flag.Uint("parts-num", 0, "分片模式上传文件的`分片数量`，范围为 1 到 10000，设置后忽略分片大小")
+	partSize := flag.Int("part-size", 0, "分片模式上传文件的`分片大小`，单位为 MB，范围为 1 到 5120，默认为 0（即 128MB）")
+	parallelParts := flag.Int("parallel-parts", 0, "分片模式上传时每个文件的最大`并行分片数`，范围为 1 到 100，默认为 0（即 4）")
+	concurrentUploads := flag.Int("concurrent-uploads", 0, "同时上传的最大`任务数`，范围为 1 到 10，默认为 0（即 2）")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")
 
@@ -465,12 +479,52 @@ func initialize() (e error) {
 		log.Println("-parts-num 参数只支持分片上传模式")
 		os.Exit(1)
 	}
+	if (*partSize != 0 || *parallelParts != 0) && !*multipartUpload {
+		log.Println("-part-size 和 -parallel-parts 参数只支持分片上传模式")
+		os.Exit(1)
+	}
 	// 优先使用参数指定的分片数量
 	if *partsNum != 0 {
 		config.PartsNum = *partsNum
 	}
 	if config.PartsNum > maxParts {
 		log.Printf("分片数量不能大于%d", maxParts)
+		os.Exit(1)
+	}
+
+	// 优先使用参数指定的分片大小
+	if *partSize != 0 {
+		config.PartSizeMB = *partSize
+	}
+	if config.PartSizeMB == 0 {
+		config.PartSizeMB = 128
+	}
+	if config.PartSizeMB < 1 || config.PartSizeMB > 5120 {
+		log.Printf("分片大小不能小于1MB或大于5120MB")
+		os.Exit(1)
+	}
+
+	// 优先使用参数指定的并行分片数
+	if *parallelParts != 0 {
+		config.ParallelParts = *parallelParts
+	}
+	if config.ParallelParts == 0 {
+		config.ParallelParts = 4
+	}
+	if config.ParallelParts < 1 || config.ParallelParts > 100 {
+		log.Printf("并行分片数不能小于1或大于100")
+		os.Exit(1)
+	}
+
+	// 优先使用参数指定的任务数
+	if *concurrentUploads != 0 {
+		config.ConcurrentUploads = *concurrentUploads
+	}
+	if config.ConcurrentUploads == 0 {
+		config.ConcurrentUploads = 2
+	}
+	if config.ConcurrentUploads < 1 || config.ConcurrentUploads > 10 {
+		log.Printf("同时上传的任务数不能小于1或大于10")
 		os.Exit(1)
 	}
 
@@ -575,18 +629,20 @@ func initialize() (e error) {
 
 func main() {
 	defer func() {
+		stopBarPool()
 		if len(result.Failed) != 0 {
 			os.Exit(1)
 		}
 	}()
 
-	go handleQuit()
-
-	err := initialize()
-	checkErr(err)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go watchStop(ctx, cancel)
+
+	if err := initialize(); err != nil {
+		log.Fatal(err)
+	}
+
 	go getInput(ctx)
 	defer closeKeybord()
 
@@ -599,6 +655,7 @@ func main() {
 		info, err := os.Stat(file)
 		if err != nil {
 			log.Printf("获取 %s 的信息出现错误：%v", file, err)
+			continue
 		}
 
 		if info.IsDir() {
@@ -686,54 +743,89 @@ func main() {
 		}
 	}
 
-	for _, file := range files {
-		if !file.uploadFile() {
-			break
+	// 多个任务并行上传
+	tasks := make(chan fileInfo)
+	var wg sync.WaitGroup
+	go func() {
+		defer close(tasks)
+		for _, file := range files {
+			select {
+			case tasks <- file:
+			case <-ctx.Done():
+				return
+			}
 		}
+	}()
+	for i := 0; i < config.ConcurrentUploads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range tasks {
+				file.uploadFile(ctx)
+			}
+		}()
 	}
+	wg.Wait()
 }
 
-// 上传文件，返回 false 表示用户按 q 键要求停止上传
-func (file *fileInfo) uploadFile() bool {
+// 上传文件
+func (file *fileInfo) uploadFile(ctx context.Context) {
 	switch {
 	case *fastUpload:
-		_, err := file.fastUploadFile()
-		if err != nil {
+		if _, err := file.fastUploadFile(); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
-			result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-			return true
+			recordFailed(file.Path, file.ParentID)
+			return
 		}
-		result.Success = append(result.Success, file.Path)
+		recordSuccess(file.Path)
 	case *upload:
 		token, err := file.fastUploadFile()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
+			if token == nil {
+				// 获取上传 token 失败，无法继续上传
+				recordFailed(file.Path, file.ParentID)
+				return
+			}
 			log.Printf("现在开始使用普通模式上传 %s", file.Path)
-			err := ossUploadFile(token, file.Path)
-			if err != nil {
+			if err := ossUploadFile(ctx, token, file.Path, file.ParentID); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				log.Printf("普通模式上传 %s 出现错误：%v", file.Path, err)
-				result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-				return true
+				recordFailed(file.Path, file.ParentID)
+				return
 			}
 		}
-		result.Success = append(result.Success, file.Path)
+		recordSuccess(file.Path)
 	case *multipartUpload:
 		token, err := file.fastUploadFile()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
+			if token == nil {
+				// 获取上传 token 失败，无法继续上传
+				recordFailed(file.Path, file.ParentID)
+				return
+			}
 			log.Println("现在开始使用分片模式上传")
-			err := multipartUploadFile(token, file.Path)
-			if err != nil {
-				if errors.Is(err, errStopUpload) {
-					return false
+			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID); err != nil {
+				if ctx.Err() != nil {
+					return
 				}
 				log.Printf("分片模式上传 %s 出现错误：%v", file.Path, err)
-				result.Failed = append(result.Failed, failedFile{Path: file.Path, CID: file.ParentID})
-				return true
+				recordFailed(file.Path, file.ParentID)
+				return
 			}
 		}
-		result.Success = append(result.Success, file.Path)
+		recordSuccess(file.Path)
 	}
-
-	return true
 }

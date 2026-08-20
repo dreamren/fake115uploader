@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -18,6 +20,7 @@ import (
 
 // 进度监听
 type multipartProgressListener struct {
+	bar  *pb.ProgressBar
 	last int64 // 上一次进度事件时该分片已上传的字节数
 }
 
@@ -28,187 +31,222 @@ func (listener *multipartProgressListener) ProgressChanged(event *oss.ProgressEv
 		listener.last = 0
 	case oss.TransferDataEvent:
 		// 实时更新进度，避免上传大文件时进度条长时间停留在 0%
-		bar.Add64(event.ConsumedBytes - listener.last)
+		listener.bar.Add64(event.ConsumedBytes - listener.last)
 		listener.last = event.ConsumedBytes
 	case oss.TransferCompletedEvent:
-		bar.Add64(event.ConsumedBytes - listener.last)
+		listener.bar.Add64(event.ConsumedBytes - listener.last)
 		listener.last = 0
 	case oss.TransferFailedEvent:
 		// 分片上传失败，回滚该分片已计入进度的字节数
-		bar.Add64(-listener.last)
+		listener.bar.Add64(-listener.last)
 		listener.last = 0
 	default:
 	}
 }
 
-// 获取 ossToken 和 bucket
-func getBucket(bucketName string) (ot *ossToken, bucket *oss.Bucket, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("getBucket() error: %v", err)
-		}
-	}()
+// 按文件大小分割分片，优先使用指定的分片数量，否则按分片大小分片
+func splitChunks(file string, size int64) ([]oss.FileChunk, error) {
+	if config.PartsNum != 0 {
+		return oss.SplitFileByPartNum(file, int(config.PartsNum))
+	}
 
-	ot, err := getOSSToken()
-	checkErr(err)
-	client, err := oss.New(ot.endpoint, ot.AccessKeyID, ot.AccessKeySecret, getClientOptions()...)
-	checkErr(err)
-	bucket, err = client.Bucket(bucketName)
-	checkErr(err)
-	return ot, bucket, nil
+	partSize := int64(config.PartSizeMB) * 1024 * 1024
+	// 单个分片大小不能小于 100KB
+	if partSize < 100*1024 {
+		partSize = 100 * 1024
+	}
+	// 分片数量不能超过 maxParts，超过时按分片数量上限重新计算分片大小
+	if size > partSize*maxParts {
+		partSize = (size + maxParts - 1) / maxParts
+	}
+
+	return oss.SplitFileByPartSize(file, partSize)
 }
 
-// 利用 oss 的接口以 multipart 的方式上传文件
-func multipartUploadFile(ft *fastToken, file string) (e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("multipartUploadFile() error: %v", err)
+// 上传单个分片，出现错误就重试，共尝试 3 次
+func uploadPartWithRetry(ctx context.Context, tm *ossTokenManager, imur oss.InitiateMultipartUploadResult,
+	f *os.File, chunk oss.FileChunk, file string, bar *pb.ProgressBar) (oss.UploadPart, error) {
+	var lastErr error
+	for retry := 0; retry < 3; retry++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return oss.UploadPart{}, lastErr
+			}
+			return oss.UploadPart{}, err
 		}
-	}()
 
+		ot, bucket := tm.get()
+		if _, err := f.Seek(chunk.Offset, io.SeekStart); err != nil {
+			return oss.UploadPart{}, fmt.Errorf("移动 %s 的读取位置出现错误：%w", file, err)
+		}
+		listener := &multipartProgressListener{bar: bar}
+		part, err := bucket.UploadPart(imur, f, chunk.Size, chunk.Number,
+			oss.SetHeader("x-oss-security-token", ot.SecurityToken),
+			oss.UserAgentHeader(aliUserAgent),
+			oss.Progress(listener),
+		)
+		if err == nil {
+			return part, nil
+		}
+		// 回滚失败分片已显示的进度
+		bar.Add64(-listener.last)
+		listener.last = 0
+
+		lastErr = err
+		log.Printf("上传 %s 的第%d个分片时出现错误：%v", file, chunk.Number, err)
+		if retry < 2 {
+			log.Printf("等待 %d 秒后尝试重新上传第%d个分片", retry+1, chunk.Number)
+			select {
+			case <-time.After(time.Duration(retry+1) * time.Second):
+			case <-ctx.Done():
+				return oss.UploadPart{}, lastErr
+			}
+		}
+	}
+
+	return oss.UploadPart{}, lastErr
+}
+
+// 中止 OSS 上的分片上传任务，避免残留已上传的分片
+func abortUpload(tm *ossTokenManager, imur oss.InitiateMultipartUploadResult, file string) {
+	ot, bucket := tm.get()
+	if err := bucket.AbortMultipartUpload(imur,
+		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
+		oss.UserAgentHeader(aliUserAgent),
+	); err != nil {
+		log.Printf("中止 %s 在 OSS 上的分片上传任务出现错误：%v", file, err)
+	}
+}
+
+// 利用 oss 的接口以分片并行的方式上传文件
+func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64) (e error) {
 	log.Println("分片模式上传文件：" + file)
 
-	ot, bucket, err := getBucket(ft.Bucket)
-	checkErr(err)
-	// ossToken 一小时后就会失效，所以每 50 分钟重新获取一次
-	ticker := time.NewTicker(50 * time.Minute)
-	defer ticker.Stop()
-
-	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
-	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
-
 	info, err := os.Stat(file)
-	checkErr(err)
-
+	if err != nil {
+		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
+	}
 	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 	if info.Size() <= 1024 {
-		// 此时不能打开文件，否则文件被占用会导致上传后删除文件失败
 		log.Printf("%s 的大小小于1KB，改用普通模式上传", file)
-		return ossUploadFile(ft, file)
+		return ossUploadFile(ctx, ft, file, parentCID)
 	}
 	// 上传的文件大小不能超过 115GB
 	if info.Size() > 115*1024*1024*1024 {
 		return fmt.Errorf("%s 的大小超过115GB，取消上传", file)
 	}
 
-	var chunks []oss.FileChunk
-	// 是否指定分片数量
-	if config.PartsNum != 0 {
-		chunks, err = oss.SplitFileByPartNum(file, int(config.PartsNum))
-		checkErr(err)
-	} else {
-		for i := int64(1); i < 10; i++ {
-			if info.Size() < i*1024*1024*1024 {
-				// 文件大小小于 iGB 时分为 i*1000 片
-				chunks, err = oss.SplitFileByPartNum(file, int(i*1000))
-				checkErr(err)
-				break
-			}
-		}
-		if info.Size() > 9*1024*1024*1024 {
-			// 文件大小大于 9GB 时分为 10000 片
-			chunks, err = oss.SplitFileByPartNum(file, maxParts)
-			checkErr(err)
-		}
-	}
-	// 单个分片大小不能小于 100KB
-	if chunks[0].Size < 100*1024 {
-		chunks, err = oss.SplitFileByPartSize(file, 100*1024)
-		checkErr(err)
+	tm, err := newOssTokenManager(ctx, ft.Bucket)
+	if err != nil {
+		return err
 	}
 
+	chunks, err := splitChunks(file, info.Size())
+	if err != nil {
+		return fmt.Errorf("分割 %s 的分片出现错误：%w", file, err)
+	}
+
+	ot, bucket := tm.get()
 	imur, err := bucket.InitiateMultipartUpload(ft.Object,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.UserAgentHeader(aliUserAgent),
 		oss.Sequential(),
 	)
-	checkErr(err)
-
-	f, err := os.Open(file)
-	checkErr(err)
-	defer f.Close()
+	if err != nil {
+		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
+	}
 
 	fmt.Println("按 q 键停止上传并退出程序")
-	// 已成功上传的分片总字节数
-	var committed int64
-	var parts []oss.UploadPart
-	bar = pb.New64(info.Size()).SetTemplate(pb.Full).Set(pb.Bytes, true)
-	bar.Start()
+	bar := newBar(info.Size(), filepath.Base(file))
 	defer bar.Finish()
 
-	// 中止 OSS 上的分片上传任务，避免残留已上传的分片
-	abortUpload := func() {
-		if err := bucket.AbortMultipartUpload(imur,
-			oss.SetHeader("x-oss-security-token", ot.SecurityToken),
-			oss.UserAgentHeader(aliUserAgent),
-		); err != nil {
-			log.Printf("中止 %s 在 OSS 上的分片上传任务出现错误：%v", file, err)
+	// 分片并行上传，一个分片失败则取消其余分片
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+
+	parts := make([]oss.UploadPart, len(chunks))
+	var mu sync.Mutex
+	var firstErr error
+	setErr := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
 		}
+		mu.Unlock()
+		cancelUpload()
 	}
 
-	uploadingPart = true
-	defer func() {
-		uploadingPart = false
-	}()
+	workers := config.ParallelParts
+	if workers > len(chunks) {
+		workers = len(chunks)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if *verbose {
+		log.Printf("开始并行上传 %s 的 %d 个分片，并行数是 %d", file, len(chunks), workers)
+	}
+
+	chunkCh := make(chan oss.FileChunk)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 每个 worker 打开独立的文件句柄，避免并发 Seek 互相干扰
+			f, err := os.Open(file)
+			if err != nil {
+				setErr(fmt.Errorf("打开 %s 出现错误：%w", file, err))
+				return
+			}
+			defer f.Close()
+
+			for chunk := range chunkCh {
+				if uploadCtx.Err() != nil {
+					continue
+				}
+				if *verbose {
+					log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
+				}
+				part, err := uploadPartWithRetry(uploadCtx, tm, imur, f, chunk, file, bar)
+				if err != nil {
+					setErr(err)
+					continue
+				}
+				// 分片号从 1 开始，按序存放以便合并
+				parts[chunk.Number-1] = part
+			}
+		}()
+	}
+
+	// 分发分片任务
+dispatch:
 	for _, chunk := range chunks {
 		select {
-		case <-multipartCh:
-			// 按 q 键停止上传，先中止 OSS 上的上传任务再通知退出程序
-			bar.Finish()
-			abortUpload()
-			multipartCh <- struct{}{}
-			return errStopUpload
-		default:
-			if *verbose {
-				log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
-			}
-			var part oss.UploadPart
-			// 出现错误就继续尝试，共尝试 3 次
-			for retry := 0; retry < 3; retry++ {
-				select {
-				case <-ticker.C:
-					// 到时重新获取 ossToken
-					ot, bucket, err = getBucket(ft.Bucket)
-					checkErr(err)
-				default:
-				}
-				f.Seek(chunk.Offset, io.SeekStart)
-				part, err = bucket.UploadPart(imur, f, chunk.Size, chunk.Number,
-					oss.SetHeader("x-oss-security-token", ot.SecurityToken),
-					oss.UserAgentHeader(aliUserAgent),
-					oss.Progress(&multipartProgressListener{}),
-				)
-				if err == nil {
-					break
-				} else {
-					log.Printf("上传 %s 的第%d个分片时出现错误：%v", file, chunk.Number, err)
-					// 回滚失败分片已显示的进度
-					bar.SetCurrent(committed)
-					if retry != 2 {
-						log.Printf("等待 %d 秒后尝试重新上传第%d个分片", retry+1, chunk.Number)
-						time.Sleep(time.Duration(retry+1) * time.Second)
-					}
-				}
-			}
-			if err != nil {
-				bar.Finish()
-				abortUpload()
-				return fmt.Errorf("上传 %s 的第%d个分片时出现错误：%w", file, chunk.Number, err)
-			}
-			parts = append(parts, part)
-			committed += chunk.Size
+		case chunkCh <- chunk:
+		case <-uploadCtx.Done():
+			break dispatch
 		}
 	}
-	uploadingPart = false
-	bar.Finish()
+	close(chunkCh)
+	wg.Wait()
 
-	select {
-	case <-ticker.C:
-		// 到时重新获取 ossToken
-		ot, bucket, err = getBucket(ft.Bucket)
-		checkErr(err)
-	default:
+	mu.Lock()
+	err = firstErr
+	mu.Unlock()
+	if err != nil {
+		abortUpload(tm, imur, file)
+		return err
 	}
+	if err = ctx.Err(); err != nil {
+		// 用户主动停止上传
+		abortUpload(tm, imur, file)
+		return err
+	}
+
+	ot, bucket = tm.get()
+	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
+	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
 	var header http.Header
 	cmur, err := bucket.CompleteMultipartUpload(imur, parts,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
@@ -222,7 +260,7 @@ func multipartUploadFile(ft *fastToken, file string) (e error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		// 当文件名含有 &< 这两个字符之一时响应的 xml 解析会出现错误，实际上上传是成功的
 		if filename := filepath.Base(file); !strings.ContainsAny(filename, "&<") {
-			panic(err)
+			return fmt.Errorf("完成 %s 的分片上传出现错误：%w", file, err)
 		}
 	}
 	if *verbose {
@@ -230,21 +268,15 @@ func multipartUploadFile(ft *fastToken, file string) (e error) {
 		log.Printf("cmur 的值是：%+v", cmur)
 	}
 
-	time.Sleep(time.Second)
 	// 验证上传是否成功
-	fileURL := fmt.Sprintf(listFileURL, config.CID, 20)
-	v, err := getURLJSON(fileURL)
-	checkErr(err)
-	s := string(v.GetStringBytes("data", "0", "sha"))
-	if s == ft.SHA1 {
-		log.Printf("分片模式上传 %s 成功", file)
-		if *removeFile {
-			f.Close()
-			err = remove(file)
-			checkErr(err)
+	if err = verifyUploaded(parentCID, filepath.Base(file), ft.SHA1); err != nil {
+		return err
+	}
+	log.Printf("分片模式上传 %s 成功", file)
+	if *removeFile {
+		if err = remove(file); err != nil {
+			return err
 		}
-	} else {
-		panic(fmt.Errorf("分片模式上传 %s 失败", file))
 	}
 
 	return nil

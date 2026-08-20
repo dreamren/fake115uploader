@@ -2,22 +2,24 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/cheggaaa/pb/v3"
 	"github.com/valyala/fastjson"
 )
-
-var bar *pb.ProgressBar // 上传进度条
 
 type uploadInfo struct {
 	Endpoint    string `json:"endpoint"`
@@ -33,103 +35,139 @@ type ossToken struct {
 	endpoint        string
 }
 
+// 进度条池，支持多个上传任务同时显示进度条
+var (
+	barPool     = pb.NewPool()
+	barPoolOnce sync.Once
+	useBarPool  bool
+	stdoutIsTTY = func() bool {
+		info, err := os.Stdout.Stat()
+		return err == nil && info.Mode()&os.ModeCharDevice != 0
+	}()
+)
+
+// 创建带文件名前缀的进度条
+func newBar(total int64, prefix string) *pb.ProgressBar {
+	b := pb.New64(total).SetTemplate(pb.Full).Set(pb.Bytes, true).Set("prefix", prefix)
+	if stdoutIsTTY {
+		barPoolOnce.Do(func() {
+			if err := barPool.Start(); err == nil {
+				useBarPool = true
+			} else {
+				log.Printf("启动进度条池出现错误：%v", err)
+			}
+		})
+		if useBarPool {
+			barPool.Add(b)
+			return b
+		}
+	}
+	b.Start()
+	return b
+}
+
+// 停止进度条池
+func stopBarPool() {
+	if useBarPool {
+		barPool.Stop()
+	}
+}
+
 // 进度监听
-type ossProgressListener struct{}
+type ossProgressListener struct {
+	bar *pb.ProgressBar
+}
 
 // 实现 oss.ProgressListener 的接口
 func (listener *ossProgressListener) ProgressChanged(event *oss.ProgressEvent) {
 	switch event.EventType {
-	case oss.TransferStartedEvent:
-		bar = pb.New64(event.TotalBytes).SetTemplate(pb.Full).Set(pb.Bytes, true).Start()
 	case oss.TransferDataEvent:
-		bar.SetCurrent(event.ConsumedBytes)
-	case oss.TransferCompletedEvent:
-		bar.Finish()
-	case oss.TransferFailedEvent:
-		bar.Finish()
+		listener.bar.SetCurrent(event.ConsumedBytes)
+	case oss.TransferCompletedEvent, oss.TransferFailedEvent:
+		listener.bar.Finish()
 	default:
 	}
 }
 
 // 获取网页请求响应的 json
 func getURLJSON(url string) (v *fastjson.Value, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("getURLJSON() error: %v", err)
-		}
-	}()
-
 	body, err := getURL(url)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	var p fastjson.Parser
 	v, err = p.ParseBytes(body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("解析 %s 的响应出现错误：%w", url, err)
+	}
 
 	return v, nil
 }
 
 // 获取 POST 表单请求响应的 json
 func postFormJSON(url string, formStr string) (v *fastjson.Value, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("postFormJSON() error: %v", err)
-		}
-	}()
-
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer([]byte(formStr)))
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("构造请求 %s 出现错误：%w", url, err)
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Cookie", config.Cookies)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := doRequest(req)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s 的响应出现错误：%w", url, err)
+	}
 
 	var p fastjson.Parser
 	v, err = p.ParseBytes(body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("解析 %s 的响应出现错误：%w", url, err)
+	}
 	return v, nil
 }
 
 // 以 GET 请求获取网页内容
 func getURL(url string) (body []byte, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("getURL() error: %v", err)
-		}
-	}()
-
 	req, err := http.NewRequest(http.MethodGet, url, nil)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("构造请求 %s 出现错误：%w", url, err)
+	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Cookie", config.Cookies)
 	resp, err := doRequest(req)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	body, err = io.ReadAll(resp.Body)
-	checkErr(err)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s 的响应出现错误：%w", url, err)
+	}
 
 	return body, nil
 }
 
 // 获取 oss 的 token
 func getOSSToken() (token *ossToken, e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("getOSSToken() error: %v", err)
-		}
-	}()
-
 	token = new(ossToken)
 	body, err := getURL(getinfoURL)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	var info uploadInfo
-	err = json.Unmarshal(body, &info)
-	checkErr(err)
+	if err = json.Unmarshal(body, &info); err != nil {
+		return nil, fmt.Errorf("解析 getuploadinfo 的响应出现错误：%w", err)
+	}
 	if *internal {
 		i := strings.Index(info.Endpoint, ".aliyuncs.com")
+		if i < 0 {
+			return nil, fmt.Errorf("OSS endpoint %s 无法转换为内网地址", info.Endpoint)
+		}
 		token.endpoint = info.Endpoint[:i] + "-internal" + info.Endpoint[i:]
 	} else {
 		token.endpoint = info.Endpoint
@@ -140,9 +178,12 @@ func getOSSToken() (token *ossToken, e error) {
 	}
 
 	body, err = getURL(info.GetTokenURL)
-	checkErr(err)
-	err = json.Unmarshal(body, &token)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(body, &token); err != nil {
+		return nil, fmt.Errorf("解析 OSS token 的响应出现错误：%w", err)
+	}
 
 	if *verbose {
 		log.Printf("OSS token 的值：\n%+v", token)
@@ -164,51 +205,189 @@ func getClientOptions() (options []oss.ClientOption) {
 	return options
 }
 
-// 利用 oss 的接口上传文件
-func ossUploadFile(ft *fastToken, file string) (e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("ossUploadFile() error: %v", err)
-		}
-	}()
+// ossToken 的管理器，在 token 到期前主动刷新并重建 OSS 客户端
+type ossTokenManager struct {
+	ctx        context.Context
+	bucketName string
+	mu         sync.Mutex
+	ot         *ossToken
+	bucket     *oss.Bucket
+	expiresAt  time.Time
+}
 
+// 创建 ossToken 管理器，并启动后台主动刷新协程
+func newOssTokenManager(ctx context.Context, bucketName string) (*ossTokenManager, error) {
+	m := &ossTokenManager{ctx: ctx, bucketName: bucketName}
+	if err := m.refresh(); err != nil {
+		return nil, err
+	}
+	go m.autoRefresh()
+
+	return m, nil
+}
+
+// 刷新 token 并重建 OSS 客户端
+func (m *ossTokenManager) refresh() error {
+	ot, err := getOSSToken()
+	if err != nil {
+		return err
+	}
+	client, err := oss.New(ot.endpoint, ot.AccessKeyID, ot.AccessKeySecret, getClientOptions()...)
+	if err != nil {
+		return fmt.Errorf("创建 OSS 客户端出现错误：%w", err)
+	}
+	bucket, err := client.Bucket(m.bucketName)
+	if err != nil {
+		return fmt.Errorf("获取 OSS bucket 出现错误：%w", err)
+	}
+
+	// token 的过期时间解析失败时，默认 50 分钟后过期
+	expiresAt := time.Now().Add(50 * time.Minute)
+	if t, err := time.Parse(time.RFC3339, ot.Expiration); err == nil {
+		expiresAt = t
+	}
+
+	m.mu.Lock()
+	m.ot = ot
+	m.bucket = bucket
+	m.expiresAt = expiresAt
+	m.mu.Unlock()
+
+	return nil
+}
+
+// 获取当前 token 和 bucket，快到期时同步刷新一次兜底
+func (m *ossTokenManager) get() (*ossToken, *oss.Bucket) {
+	m.mu.Lock()
+	expiring := time.Now().After(m.expiresAt.Add(-2 * time.Minute))
+	m.mu.Unlock()
+
+	if expiring {
+		if err := m.refresh(); err != nil {
+			log.Printf("刷新 ossToken 出现错误：%v", err)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ot, m.bucket
+}
+
+// 后台协程，在 token 到期前 5 分钟主动刷新
+func (m *ossTokenManager) autoRefresh() {
+	for {
+		m.mu.Lock()
+		expiresAt := m.expiresAt
+		m.mu.Unlock()
+
+		// 到期前 5 分钟刷新，已过期的立刻刷新
+		d := time.Until(expiresAt.Add(-5 * time.Minute))
+		if d <= 0 {
+			d = time.Second
+		}
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-time.After(d):
+		}
+
+		if err := m.refresh(); err != nil {
+			log.Printf("主动刷新 ossToken 出现错误：%v", err)
+			// 刷新失败后退避重试
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+		}
+	}
+}
+
+// 按文件名精确搜索验证文件是否上传成功
+func verifyUpload(parentCID uint64, filename, fileSHA1 string) (bool, error) {
+	reqURL, err := url.Parse(fmt.Sprintf(searchURL, parentCID))
+	if err != nil {
+		return false, fmt.Errorf("解析搜索链接出现错误：%w", err)
+	}
+	query := reqURL.Query()
+	query.Set("search_value", filename)
+	reqURL.RawQuery = query.Encode()
+
+	v, err := getURLJSON(reqURL.String())
+	if err != nil {
+		return false, err
+	}
+
+	for _, e := range v.GetArray("data") {
+		// 文件夹没有 fid 字段
+		if !e.Exists("fid") {
+			continue
+		}
+		if string(e.GetStringBytes("n")) == filename && strings.ToUpper(string(e.GetStringBytes("sha"))) == fileSHA1 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// 验证上传是否成功，服务端入库有延迟，共尝试 3 次
+func verifyUploaded(parentCID uint64, filename, fileSHA1 string) error {
+	for i := 0; i < 3; i++ {
+		ok, err := verifyUpload(parentCID, filename, fileSHA1)
+		if err != nil {
+			log.Printf("验证上传 %s 出现错误（第%d次尝试）：%v", filename, i+1, err)
+		} else if ok {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("验证上传 %s 失败", filename)
+}
+
+// 利用 oss 的接口上传文件
+func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64) (e error) {
 	log.Println("普通模式上传文件：" + file)
 
-	ot, err := getOSSToken()
-	checkErr(err)
-	client, err := oss.New(ot.endpoint, ot.AccessKeyID, ot.AccessKeySecret, getClientOptions()...)
-	checkErr(err)
-	bucket, err := client.Bucket(ft.Bucket)
-	checkErr(err)
+	info, err := os.Stat(file)
+	if err != nil {
+		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
+	}
+
+	tm, err := newOssTokenManager(ctx, ft.Bucket)
+	if err != nil {
+		return err
+	}
+	ot, bucket := tm.get()
 
 	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
+	bar := newBar(info.Size(), filepath.Base(file))
 	options := []oss.Option{
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.Callback(cb),
 		oss.CallbackVar(cbVar),
 		oss.UserAgentHeader(aliUserAgent),
-		oss.Progress(&ossProgressListener{}),
+		oss.Progress(&ossProgressListener{bar: bar}),
 	}
 
 	fmt.Println("按 q 键停止上传并退出程序")
 	err = bucket.PutObjectFromFile(ft.Object, file, options...)
-	checkErr(err)
+	if err != nil {
+		bar.Finish()
+		return fmt.Errorf("普通模式上传 %s 出现错误：%w", file, err)
+	}
+	bar.Finish()
 
-	time.Sleep(time.Second)
-	// 验证上传是否成功
-	fileURL := fmt.Sprintf(listFileURL, config.CID, 20)
-	v, err := getURLJSON(fileURL)
-	checkErr(err)
-	s := string(v.GetStringBytes("data", "0", "sha"))
-	if s == ft.SHA1 {
-		log.Printf("普通模式上传 %s 成功", file)
-		if *removeFile {
-			err = remove(file)
-			checkErr(err)
+	if err = verifyUploaded(parentCID, filepath.Base(file), ft.SHA1); err != nil {
+		return err
+	}
+	log.Printf("普通模式上传 %s 成功", file)
+	if *removeFile {
+		if err = remove(file); err != nil {
+			return err
 		}
-	} else {
-		panic(fmt.Errorf("普通模式上传 %s 失败", file))
 	}
 
 	return nil
