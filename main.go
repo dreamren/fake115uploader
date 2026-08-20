@@ -443,7 +443,7 @@ func initialize() (e error) {
 	recursive = flag.Bool("recursive", false, "递归上传文件夹")
 	partsNum := flag.Uint("parts-num", 0, "分片模式上传文件的`分片数量`，范围为 1 到 10000，设置后忽略分片大小")
 	partSize := flag.Int("part-size", 0, "分片模式上传文件的`分片大小`，单位为 MB，范围为 1 到 5120，默认为 0（即 128MB）")
-	parallelParts := flag.Int("parallel-parts", 0, "分片模式上传时每个文件的最大`并行分片数`，范围为 1 到 100，默认为 0（即 4）")
+	parallelParts := flag.Int("parallel-parts", 0, "已无效：115 要求分片按序上传，分片无法并行，请用 -concurrent-uploads 提升速度")
 	concurrentUploads := flag.Int("concurrent-uploads", 0, "同时上传的最大`任务数`，范围为 1 到 10，默认为 0（即 2）")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")

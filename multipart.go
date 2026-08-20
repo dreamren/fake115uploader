@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -147,11 +146,13 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	}
 
 	ot, bucket := tm.get()
-	// 不能设置 oss.Sequential()，该参数要求分片必须按序号顺序上传，
-	// 与分片并行上传冲突，会导致 OSS 返回 PartNotSequential 错误
+	// 必须设置 oss.Sequential()：115 定制的 OSS 只在顺序模式下计算整个文件的 SHA1，
+	// callback 里的 ${sha1} 才会被正确填充，115 服务端校验才能通过。
+	// 顺序模式要求分片按序号上传，因此分片只能串行上传，速度靠多任务并行弥补
 	imur, err := bucket.InitiateMultipartUpload(ft.Object,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.UserAgentHeader(aliUserAgent),
+		oss.Sequential(),
 	)
 	if err != nil {
 		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
@@ -161,103 +162,46 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	bar := newBar(info.Size(), filepath.Base(file))
 	defer bar.Finish()
 
-	// 分片并行上传，一个分片失败则取消其余分片
-	uploadCtx, cancelUpload := context.WithCancel(ctx)
-	defer cancelUpload()
-
-	parts := make([]oss.UploadPart, len(chunks))
-	var mu sync.Mutex
-	var firstErr error
-	setErr := func(err error) {
-		mu.Lock()
-		if firstErr == nil {
-			firstErr = err
-		}
-		mu.Unlock()
-		cancelUpload()
-	}
-
-	workers := config.ParallelParts
-	if workers > len(chunks) {
-		workers = len(chunks)
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	if *verbose {
-		log.Printf("开始并行上传 %s 的 %d 个分片，并行数是 %d", file, len(chunks), workers)
-	}
-
-	chunkCh := make(chan oss.FileChunk)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// 每个 worker 打开独立的文件句柄，避免并发 Seek 互相干扰
-			f, err := os.Open(file)
-			if err != nil {
-				setErr(fmt.Errorf("打开 %s 出现错误：%w", file, err))
-				return
-			}
-			defer f.Close()
-
-			for chunk := range chunkCh {
-				if uploadCtx.Err() != nil {
-					continue
-				}
-				if *verbose {
-					log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
-				}
-				part, err := uploadPartWithRetry(uploadCtx, tm, imur, f, chunk, file, bar)
-				if err != nil {
-					setErr(err)
-					continue
-				}
-				// 分片号从 1 开始，按序存放以便合并
-				parts[chunk.Number-1] = part
-			}
-		}()
-	}
-
-	// 分发分片任务
-dispatch:
-	for _, chunk := range chunks {
-		select {
-		case chunkCh <- chunk:
-		case <-uploadCtx.Done():
-			break dispatch
-		}
-	}
-	close(chunkCh)
-	wg.Wait()
-
-	mu.Lock()
-	err = firstErr
-	mu.Unlock()
+	// 顺序模式要求分片按序号依次上传，只能串行上传分片
+	f, err := os.Open(file)
 	if err != nil {
 		abortUpload(tm, imur, file)
-		return err
+		return fmt.Errorf("打开 %s 出现错误：%w", file, err)
 	}
-	if err = ctx.Err(); err != nil {
-		// 用户主动停止上传
-		abortUpload(tm, imur, file)
-		return err
+	defer f.Close()
+
+	parts := make([]oss.UploadPart, len(chunks))
+	if *verbose {
+		log.Printf("开始按序上传 %s 的 %d 个分片", file, len(chunks))
+	}
+	for _, chunk := range chunks {
+		if err = ctx.Err(); err != nil {
+			// 用户主动停止上传
+			abortUpload(tm, imur, file)
+			return err
+		}
+		if *verbose {
+			log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
+		}
+		part, err := uploadPartWithRetry(ctx, tm, imur, f, chunk, file, bar)
+		if err != nil {
+			abortUpload(tm, imur, file)
+			return err
+		}
+		// 分片号从 1 开始，按序存放以便合并
+		parts[chunk.Number-1] = part
 	}
 
 	ot, bucket = tm.get()
-	// 并行分片模式下 115 定制的 OSS 不会计算整个文件的 SHA1，callback 里的 ${sha1}
-	// 占位符必须由客户端替换为本地计算的文件 SHA1，否则 115 服务端收不到 SHA1 会拒绝入库
-	callback := strings.ReplaceAll(ft.Callback.Callback, "${sha1}", ft.SHA1)
-	cb := base64.StdEncoding.EncodeToString([]byte(callback))
+	// 顺序模式下 115 定制的 OSS 会计算整个文件的 SHA1 并自动填充 callback 里的
+	// ${sha1} 占位符，客户端不能替换它；x-oss-hash-sha1 头用于 OSS 侧的完整性校验
+	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
-	if *verbose {
-		log.Printf("发送的 callback 的内容是：%s", callback)
-	}
 	var header http.Header
 	var callbackBody []byte
 	cmur, err := bucket.CompleteMultipartUpload(imur, parts,
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
+		oss.SetHeader("x-oss-hash-sha1", ft.SHA1),
 		oss.Callback(cb),
 		oss.CallbackVar(cbVar),
 		oss.UserAgentHeader(aliUserAgent),
