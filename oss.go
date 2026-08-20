@@ -40,68 +40,82 @@ var (
 		return err == nil && info.Mode()&os.ModeCharDevice != 0
 	}()
 
-	// 进度条池管理：pb.Pool 在所有进度条完成后的下一次刷新时会停止渲染且无法重启，
-	// 多文件依次上传时后面的文件就没有进度条了，因此检测到全部完成后换用新的池
-	barMu       sync.Mutex
-	curPool     *pb.Pool           // 当前正在渲染的进度条池
-	curPoolBars []*pb.ProgressBar  // 已加入当前池的进度条
+	// 进度条池，程序启动后只创建一次
+	barMu   sync.Mutex
+	barPool *pb.Pool
+
+	// 总进度条：显示已处理完成的文件数（成功 + 失败）。
+	// 它还有保活作用：pb 库的池在所有进度条完成后的下一次刷新时会停止渲染且无法重启，
+	// 总进度条在上传结束前不会完成，保证池的渲染协程全程存活
+	aggBar = pb.New64(0).SetTemplate(pb.Full).Set("prefix", "总计").SetWriter(os.Stdout)
 )
 
-// 等待旧池完成最后一次渲染的时间，略大于 pb 库的默认刷新间隔（200ms）
-const barSwitchDelay = 250 * time.Millisecond
-
-// 创建带文件名前缀的进度条
-// 进度条统一输出到 stdout，日志输出到 stderr，避免两者在终端里互相覆盖截断
-func newBar(total int64, prefix string) *pb.ProgressBar {
-	b := pb.New64(total).SetTemplate(pb.Full).Set(pb.Bytes, true).Set("prefix", prefix).SetWriter(os.Stdout)
-	if !stdoutIsTTY {
-		b.Start()
-		return b
+// 启动进度条池和总进度条，在上传任务开始前调用
+func startBarPool(totalFiles int) {
+	aggBar.SetTotal(int64(totalFiles))
+	if !stdoutIsTTY || totalFiles <= 0 {
+		return
 	}
 
 	barMu.Lock()
 	defer barMu.Unlock()
-
-	// 所有进度条都已完成时，池已停止渲染（或即将停止），换用新池
-	if curPool != nil && allBarsFinished() {
-		// 等待渲染循环把已完成进度条的最终状态渲染出来再停止
-		time.Sleep(barSwitchDelay)
-		curPool.Stop()
-		curPool = nil
-		curPoolBars = nil
+	barPool = pb.NewPool()
+	if err := barPool.Start(); err != nil {
+		log.Printf("启动进度条池出现错误：%v", err)
+		barPool = nil
+		return
 	}
-	if curPool == nil {
-		curPool = pb.NewPool()
-		if err := curPool.Start(); err != nil {
-			log.Printf("启动进度条池出现错误：%v", err)
-			curPool = nil
-			b.Start() // 退化为单进度条独立渲染
-			return b
-		}
-	}
-	curPool.Add(b)
-	curPoolBars = append(curPoolBars, b)
-	return b
+	barPool.Add(aggBar)
 }
 
-// 判断当前池里的进度条是否全部完成
-func allBarsFinished() bool {
-	for _, b := range curPoolBars {
-		if !b.IsFinished() {
-			return false
-		}
-	}
-	return true
-}
-
-// 停止进度条池
+// 停止进度条池。必须在上传任务全部结束后、打印上传结果汇总前调用，
+// 否则进度条的重绘会覆盖终端里刚打印的汇总信息
 func stopBarPool() {
 	barMu.Lock()
 	defer barMu.Unlock()
-	if curPool != nil {
-		curPool.Stop()
-		curPool = nil
+	if barPool == nil {
+		return
 	}
+	aggBar.Finish()
+	barPool.Stop()
+	barPool = nil
+}
+
+// 每个上传任务固定占用一行进度条，校验和上传阶段复用同一行，
+// 避免上传大量文件时终端里的进度条行数无限增长
+type taskBar struct {
+	bar *pb.ProgressBar
+}
+
+// 创建任务进度条并加入进度条池
+// stdout 不是终端或进度条池未启动时，创建的是不会渲染的空闲进度条，调用其方法没有副作用
+func newTaskBar() *taskBar {
+	b := pb.New64(0).SetTemplate(pb.Full).Set(pb.Bytes, true).SetWriter(os.Stdout)
+	barMu.Lock()
+	if barPool != nil {
+		barPool.Add(b)
+	}
+	barMu.Unlock()
+	return &taskBar{bar: b}
+}
+
+// 开始新阶段：更新前缀、重置进度并重新计时，速度只统计当前阶段（校验或上传）
+func (t *taskBar) beginPhase(prefix string, total int64) {
+	if t == nil || t.bar == nil {
+		return
+	}
+	t.bar.SetTotal(total)
+	t.bar.SetCurrent(0)
+	t.bar.Set("prefix", prefix)
+	t.bar.Start()
+}
+
+// 结束任务进度条
+func (t *taskBar) finish() {
+	if t == nil || t.bar == nil {
+		return
+	}
+	t.bar.Finish()
 }
 
 // 进度监听
@@ -111,6 +125,9 @@ type ossProgressListener struct {
 
 // 实现 oss.ProgressListener 的接口
 func (listener *ossProgressListener) ProgressChanged(event *oss.ProgressEvent) {
+	if listener == nil || listener.bar == nil {
+		return
+	}
 	switch event.EventType {
 	case oss.TransferDataEvent:
 		listener.bar.SetCurrent(event.ConsumedBytes)
@@ -410,7 +427,7 @@ func checkCallbackResult(callbackBody []byte, file string) error {
 }
 
 // 利用 oss 的接口上传文件
-func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64) (e error) {
+func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, tb *taskBar) (e error) {
 	log.Println("普通模式上传文件：" + file)
 
 	info, err := os.Stat(file)
@@ -426,22 +443,24 @@ func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID ui
 
 	cb := base64.StdEncoding.EncodeToString([]byte(ft.Callback.Callback))
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
-	bar := newBar(info.Size(), filepath.Base(file))
+	tb.beginPhase("上传 "+filepath.Base(file), info.Size())
+	var uploadBar *pb.ProgressBar
+	if tb != nil {
+		uploadBar = tb.bar
+	}
 	options := []oss.Option{
 		oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 		oss.Callback(cb),
 		oss.CallbackVar(cbVar),
 		oss.UserAgentHeader(aliUserAgent),
-		oss.Progress(&ossProgressListener{bar: bar}),
+		oss.Progress(&ossProgressListener{bar: uploadBar}),
 	}
 
-	fmt.Println("按 q 键停止上传并退出程序")
 	err = bucket.PutObjectFromFile(ft.Object, file, options...)
 	if err != nil {
-		bar.Finish()
+		tb.finish()
 		return fmt.Errorf("普通模式上传 %s 出现错误：%w", file, err)
 	}
-	bar.Finish()
 
 	if err = verifyUploaded(parentCID, filepath.Base(file), ft.SHA1); err != nil {
 		return err

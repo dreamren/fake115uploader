@@ -5,11 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
-
-	"github.com/cheggaaa/pb/v3"
 )
 
 // 计算文件指定范围内的 sha1 值
@@ -34,7 +31,7 @@ func hashFileRange(f *os.File, signCheck string) (rangeHash string, e error) {
 }
 
 // 计算文件的 sha1 值
-func hashSHA1(f *os.File) (blockHash, totalHash string, e error) {
+func hashSHA1(f *os.File, tb *taskBar) (blockHash, totalHash string, e error) {
 	// 计算文件最前面一个区块的 sha1 hash 值
 	block := make([]byte, 128*1024)
 	n, err := f.Read(block)
@@ -48,22 +45,18 @@ func hashSHA1(f *os.File) (blockHash, totalHash string, e error) {
 	}
 
 	// 计算整个文件的 sha1 hash 值
-	// 大文件计算 hash 需要较长时间，显示进度条避免看起来像卡住
-	var hashBar *pb.ProgressBar
-	if info, serr := f.Stat(); serr == nil && info.Size() > 16*1024*1024 {
-		log.Printf("正在计算 %s 的 SHA1 值，文件大小是 %d 字节", f.Name(), info.Size())
-		hashBar = newBar(info.Size(), f.Name()+" SHA1")
-	}
+	// 大文件计算 hash 需要较长时间，显示校验进度避免看起来像卡住
+	info, serr := f.Stat()
 	h := sha1.New()
 	var reader io.Reader = f
-	if hashBar != nil {
-		reader = hashBar.NewProxyReader(f)
+	if serr == nil {
+		tb.beginPhase("校验 "+info.Name(), info.Size())
+		if tb != nil && tb.bar != nil {
+			reader = tb.bar.NewProxyReader(f)
+		}
 	}
 	if _, err = io.Copy(h, reader); err != nil {
 		return "", "", fmt.Errorf("计算 %s 的 sha1 值出现错误：%w", f.Name(), err)
-	}
-	if hashBar != nil {
-		hashBar.Finish()
 	}
 	totalHash = strings.ToUpper(hex.EncodeToString(h.Sum(nil)))
 

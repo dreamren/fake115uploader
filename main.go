@@ -190,6 +190,7 @@ func recordSuccess(path string) {
 	resultMu.Lock()
 	result.Success = append(result.Success, path)
 	resultMu.Unlock()
+	aggBar.Increment()
 }
 
 // 记录上传失败的文件
@@ -197,6 +198,7 @@ func recordFailed(path string, cid uint64) {
 	resultMu.Lock()
 	result.Failed = append(result.Failed, failedFile{Path: path, CID: cid})
 	resultMu.Unlock()
+	aggBar.Increment()
 }
 
 // 程序退出时打印信息
@@ -755,7 +757,11 @@ func main() {
 		}
 	}
 
-	// 多个任务并行上传
+	// 多个任务并行上传，每个任务固定占用一行进度条
+	if len(files) > 0 {
+		fmt.Println("按 q 键停止上传并退出程序")
+	}
+	startBarPool(len(files))
 	tasks := make(chan fileInfo)
 	var wg sync.WaitGroup
 	go func() {
@@ -772,19 +778,29 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			var tb *taskBar
 			for file := range tasks {
-				file.uploadFile(ctx)
+				if tb == nil {
+					tb = newTaskBar()
+				}
+				file.uploadFile(ctx, tb)
+			}
+			if tb != nil {
+				tb.finish()
 			}
 		}()
 	}
 	wg.Wait()
+
+	// 先停止进度条渲染，再打印上传结果汇总，避免进度条重绘覆盖汇总信息
+	stopBarPool()
 }
 
 // 上传文件
-func (file *fileInfo) uploadFile(ctx context.Context) {
+func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 	switch {
 	case *fastUpload:
-		if _, err := file.fastUploadFile(); err != nil {
+		if _, err := file.fastUploadFile(tb); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -794,7 +810,7 @@ func (file *fileInfo) uploadFile(ctx context.Context) {
 		}
 		recordSuccess(file.Path)
 	case *upload:
-		token, err := file.fastUploadFile()
+		token, err := file.fastUploadFile(tb)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -806,7 +822,7 @@ func (file *fileInfo) uploadFile(ctx context.Context) {
 				return
 			}
 			log.Printf("现在开始使用普通模式上传 %s", file.Path)
-			if err := ossUploadFile(ctx, token, file.Path, file.ParentID); err != nil {
+			if err := ossUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -817,7 +833,7 @@ func (file *fileInfo) uploadFile(ctx context.Context) {
 		}
 		recordSuccess(file.Path)
 	case *multipartUpload:
-		token, err := file.fastUploadFile()
+		token, err := file.fastUploadFile(tb)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -829,7 +845,7 @@ func (file *fileInfo) uploadFile(ctx context.Context) {
 				return
 			}
 			log.Println("现在开始使用分片模式上传")
-			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID); err != nil {
+			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
 				if ctx.Err() != nil {
 					return
 				}

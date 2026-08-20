@@ -25,6 +25,9 @@ type multipartProgressListener struct {
 
 // 实现 oss.ProgressListener 的接口
 func (listener *multipartProgressListener) ProgressChanged(event *oss.ProgressEvent) {
+	if listener == nil || listener.bar == nil {
+		return
+	}
 	switch event.EventType {
 	case oss.TransferStartedEvent:
 		listener.last = 0
@@ -41,6 +44,15 @@ func (listener *multipartProgressListener) ProgressChanged(event *oss.ProgressEv
 		listener.last = 0
 	default:
 	}
+}
+
+// 回滚已显示的进度
+func (listener *multipartProgressListener) rollback() {
+	if listener == nil || listener.bar == nil {
+		return
+	}
+	listener.bar.Add64(-listener.last)
+	listener.last = 0
 }
 
 // 按文件大小分割分片，优先使用指定的分片数量，否则按分片大小分片
@@ -88,8 +100,7 @@ func uploadPartWithRetry(ctx context.Context, tm *ossTokenManager, imur oss.Init
 			return part, nil
 		}
 		// 回滚失败分片已显示的进度
-		bar.Add64(-listener.last)
-		listener.last = 0
+		listener.rollback()
 
 		lastErr = err
 		log.Printf("上传 %s 的第%d个分片时出现错误：%v", file, chunk.Number, err)
@@ -118,7 +129,7 @@ func abortUpload(tm *ossTokenManager, imur oss.InitiateMultipartUploadResult, fi
 }
 
 // 利用 oss 的接口以分片并行的方式上传文件
-func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64) (e error) {
+func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, tb *taskBar) (e error) {
 	log.Println("分片模式上传文件：" + file)
 
 	info, err := os.Stat(file)
@@ -128,7 +139,7 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 	if info.Size() <= 1024 {
 		log.Printf("%s 的大小小于1KB，改用普通模式上传", file)
-		return ossUploadFile(ctx, ft, file, parentCID)
+		return ossUploadFile(ctx, ft, file, parentCID, tb)
 	}
 	// 上传的文件大小不能超过 115GB
 	if info.Size() > 115*1024*1024*1024 {
@@ -158,9 +169,11 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
 	}
 
-	fmt.Println("按 q 键停止上传并退出程序")
-	bar := newBar(info.Size(), filepath.Base(file))
-	defer bar.Finish()
+	tb.beginPhase("上传 "+filepath.Base(file), info.Size())
+	var uploadBar *pb.ProgressBar
+	if tb != nil {
+		uploadBar = tb.bar
+	}
 
 	// 顺序模式要求分片按序号依次上传，只能串行上传分片
 	f, err := os.Open(file)
@@ -183,7 +196,7 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 		if *verbose {
 			log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
 		}
-		part, err := uploadPartWithRetry(ctx, tm, imur, f, chunk, file, bar)
+		part, err := uploadPartWithRetry(ctx, tm, imur, f, chunk, file, uploadBar)
 		if err != nil {
 			abortUpload(tm, imur, file)
 			return err
@@ -234,9 +247,8 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	}
 	log.Printf("分片模式上传 %s 成功", file)
 	if *removeFile {
-		// Windows 不允许删除被占用的文件，先关闭文件句柄和进度条再删除
+		// Windows 不允许删除被占用的文件，先关闭文件句柄再删除
 		f.Close()
-		bar.Finish()
 		if err = remove(file); err != nil {
 			return err
 		}

@@ -130,14 +130,14 @@ func uploadSHA1(filename, fileSize, totalHash, signKey, signVal string, targetCI
 }
 
 // 利用文件的 sha1 hash 值上传文件获取响应
-func (file *fileInfo) uploadFileSHA1() (body []byte, fileSHA1 string, e error) {
+func (file *fileInfo) uploadFileSHA1(tb *taskBar) (body []byte, fileSHA1 string, e error) {
 	f, err := os.Open(file.Path)
 	if err != nil {
 		return nil, "", fmt.Errorf("打开 %s 出现错误：%w", file.Path, err)
 	}
 	defer f.Close()
 
-	_, totalHash, err := hashSHA1(f)
+	_, totalHash, err := hashSHA1(f, tb)
 	if err != nil {
 		return nil, "", err
 	}
@@ -182,11 +182,11 @@ func (file *fileInfo) uploadFileSHA1() (body []byte, fileSHA1 string, e error) {
 }
 
 // 以秒传模式上传文件，秒传失败时返回的 token 供普通模式和分片模式使用
-func (file *fileInfo) fastUploadFile() (token *fastToken, e error) {
+func (file *fileInfo) fastUploadFile(tb *taskBar) (token *fastToken, e error) {
 	token = new(fastToken)
 	log.Println("秒传模式上传文件：" + file.Path)
 
-	body, fileSHA1, err := file.uploadFileSHA1()
+	body, fileSHA1, err := file.uploadFileSHA1(tb)
 	if err != nil {
 		return nil, err
 	}
