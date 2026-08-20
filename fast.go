@@ -182,9 +182,9 @@ func (file *fileInfo) uploadFileSHA1(tb *taskBar) (body []byte, fileSHA1 string,
 }
 
 // 以秒传模式上传文件，秒传失败时返回的 token 供普通模式和分片模式使用
+// 秒传失败是常态（新文件基本都秒传不中），失败时不打印日志
 func (file *fileInfo) fastUploadFile(tb *taskBar) (token *fastToken, e error) {
 	token = new(fastToken)
-	log.Println("秒传模式上传文件：" + file.Path)
 
 	body, fileSHA1, err := file.uploadFileSHA1(tb)
 	if err != nil {

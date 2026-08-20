@@ -802,7 +802,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
+			// 秒传失败是常态，不打印日志，结果进汇总
 			recordFailed(file.Path, file.ParentID)
 			return
 		}
@@ -813,13 +813,11 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
 			if token == nil {
 				// 获取上传 token 失败，无法继续上传
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			log.Printf("现在开始使用普通模式上传 %s", file.Path)
 			if err := ossUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
 				if ctx.Err() != nil {
 					return
@@ -836,13 +834,11 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("秒传模式上传 %s 出现错误：%v", file.Path, err)
 			if token == nil {
 				// 获取上传 token 失败，无法继续上传
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			log.Println("现在开始使用分片模式上传")
 			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
 				if ctx.Err() != nil {
 					return
