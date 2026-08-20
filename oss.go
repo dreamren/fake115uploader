@@ -47,8 +47,18 @@ var (
 	// 总进度条：显示已处理完成的文件数（成功 + 失败）。
 	// 它还有保活作用：pb 库的池在所有进度条完成后的下一次刷新时会停止渲染且无法重启，
 	// 总进度条在上传结束前不会完成，保证池的渲染协程全程存活
-	aggBar = pb.New64(0).SetTemplate(pb.Full).Set("prefix", "总计").SetWriter(os.Stdout)
+	aggBar = pb.New64(0).SetTemplate(aggBarTemplate).Set("prefix", "总计").SetWriter(os.Stdout)
 )
+
+// Docker pull 风格的任务进度条模板
+// 进行中：上传 file.mkv [================>              ] 45.20 MB/100.00 MB 12.50 MB/s ETA 45s
+// 已完成：file.mkv 完成 1m23s（失败时显示红色的"失败"）
+const taskBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}{{if eq (string . "result") "失败"}}{{red (string . "result")}}{{else}}{{green (string . "result")}}{{end}}{{rtime . "" " %s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}} {{speed . "%s/s" "0B/s"}} {{rtime . "ETA %s" "" ""}}{{end}}`
+
+// 总进度条模板
+// 进行中：总计 [=========>     ] 3/500
+// 已完成：总计 全部完成 12m3s
+const aggBarTemplate = `{{with string . "prefix"}}{{.}} {{end}}{{if .IsFinished}}全部完成 {{rtime . "" "%s" ""}}{{else}}{{bar . "[" "=" ">" " " "]"}} {{counters . "%s/%s" "%s"}}{{end}}`
 
 // 启动进度条池和总进度条，在上传任务开始前调用
 func startBarPool(totalFiles int) {
@@ -60,6 +70,9 @@ func startBarPool(totalFiles int) {
 	barMu.Lock()
 	defer barMu.Unlock()
 	barPool = pb.NewPool()
+	// 进度条统一输出到 stdout，日志输出到 stderr，避免两者在终端里互相覆盖截断
+	//（不设置时 pb 库的池默认输出到 stderr，会和日志混在同一个流里）
+	barPool.Output = os.Stdout
 	if err := barPool.Start(); err != nil {
 		log.Printf("启动进度条池出现错误：%v", err)
 		barPool = nil
@@ -88,14 +101,16 @@ type taskBar struct {
 }
 
 // 创建任务进度条并加入进度条池
-// stdout 不是终端或进度条池未启动时，创建的是不会渲染的空闲进度条，调用其方法没有副作用
+// 进度条池未启动（stdout 不是终端）时返回 nil，所有方法都是安全的空操作
 func newTaskBar() *taskBar {
-	b := pb.New64(0).SetTemplate(pb.Full).Set(pb.Bytes, true).SetWriter(os.Stdout)
 	barMu.Lock()
-	if barPool != nil {
-		barPool.Add(b)
+	defer barMu.Unlock()
+	if barPool == nil {
+		return nil
 	}
-	barMu.Unlock()
+	b := pb.New64(0).SetTemplate(taskBarTemplate).
+		Set(pb.Bytes, true).Set(pb.SIBytesPrefix, true).SetWriter(os.Stdout)
+	barPool.Add(b)
 	return &taskBar{bar: b}
 }
 
@@ -107,7 +122,23 @@ func (t *taskBar) beginPhase(prefix string, total int64) {
 	t.bar.SetTotal(total)
 	t.bar.SetCurrent(0)
 	t.bar.Set("prefix", prefix)
+	t.bar.Set("result", "")
+	// Start 会重置完成状态并重新计时；池内的 Static 进度条不会启动独立渲染协程
 	t.bar.Start()
+}
+
+// 标记任务完成，该行固定显示最终结果，类似 docker 的 Pull complete
+func (t *taskBar) done(filename string, ok bool) {
+	if t == nil || t.bar == nil {
+		return
+	}
+	t.bar.Set("prefix", filename)
+	if ok {
+		t.bar.Set("result", "完成")
+	} else {
+		t.bar.Set("result", "失败")
+	}
+	t.bar.Finish()
 }
 
 // 结束任务进度条
