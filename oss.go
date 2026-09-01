@@ -40,7 +40,7 @@ const minBarSize = 1 << 20
 // 利用 oss 的接口上传文件（普通模式）。
 // slot 是本任务固定的进度槽位；st 是本任务独立的速度监控器。
 // 上传时若连续 over秒速度低于 under MB/s（由配置/参数开启）则中断并跳过。
-func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, slot *progSlot) (e error) {
+func ossUploadFile(ctx context.Context, ft *fastToken, file string, name string, parentCID uint64, slot *progSlot) (e error) {
 	info, err := os.Stat(file)
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
@@ -56,7 +56,7 @@ func ossUploadFile(ctx context.Context, ft *fastToken, file string, parentCID ui
 	cbVar := base64.StdEncoding.EncodeToString([]byte(ft.Callback.CallbackVar))
 
 	if slot != nil {
-		slot.beginPhase("上传", filepath.Base(file), info.Size())
+		slot.beginPhase("上传", name, info.Size())
 	}
 	// 每个任务独立的速度监控器 + 进度监听
 	st := newTaskMonitor()

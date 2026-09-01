@@ -241,7 +241,26 @@ func (s *progSlot) render() string {
 		b.WriteString(" " + s.speedText)
 	}
 
+	// 文件大小
+	if s.total > 0 {
+		b.WriteString(" " + humanSize(s.total))
+	}
+
 	return b.String()
+}
+
+// 把字节数格式化成可读的大小字符串
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 // 槽位：每个并发任务一个，固定屏幕行号

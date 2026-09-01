@@ -137,7 +137,7 @@ func (file *fileInfo) uploadFileSHA1(slot *progSlot) (body []byte, fileSHA1 stri
 	}
 	defer f.Close()
 
-	_, totalHash, err := hashSHA1(f, slot)
+	_, totalHash, err := hashSHA1(f, file.Name, slot)
 	if err != nil {
 		return nil, "", err
 	}

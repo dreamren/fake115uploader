@@ -30,8 +30,8 @@ func hashFileRange(f *os.File, signCheck string) (rangeHash string, e error) {
 	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
 }
 
-// 计算文件的 sha1 值
-func hashSHA1(f *os.File, slot *progSlot) (blockHash, totalHash string, e error) {
+// 计算文件的 sha1 值。name 是进度条里展示的相对路径。
+func hashSHA1(f *os.File, name string, slot *progSlot) (blockHash, totalHash string, e error) {
 	// 计算文件最前面一个区块的 sha1 hash 值
 	block := make([]byte, 128*1024)
 	n, err := f.Read(block)
@@ -50,7 +50,7 @@ func hashSHA1(f *os.File, slot *progSlot) (blockHash, totalHash string, e error)
 	if serr == nil && info.Size() >= minBarSize && slot != nil {
 		// 大文件计算 hash 需要一定时间，在同一行显示校验进度（磁盘读取速度），
 		// 校验完成后被上传进度覆盖；小于 1MB 的文件瞬间完成，不打扰进度条显示
-		slot.beginPhase("校验", info.Name(), info.Size())
+		slot.beginPhase("校验", name, info.Size())
 		if _, err = io.Copy(h, slot.wrapReader(f)); err != nil {
 			return "", "", fmt.Errorf("计算 %s 的 sha1 值出现错误：%w", f.Name(), err)
 		}

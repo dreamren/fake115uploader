@@ -105,6 +105,7 @@ type resultData struct {
 type fileInfo struct {
 	Path     string `json:"path"`     // 文件路径
 	ParentID uint64 `json:"parentID"` // 要上传到的文件夹的 cid
+	Name     string `json:"-"`        // 进度条里展示的相对路径（相对上传根目录），顶部文件则是文件名
 }
 
 // 检查错误
@@ -755,9 +756,12 @@ func main() {
 
 						pdir := filepath.Dir(path)
 						if pid, ok := cidMap[pdir]; ok {
+							// 进度条里只显示相对于上传根目录的路径，避免整段长路径占据屏幕
+							relDir, _ := filepath.Rel(file, path)
 							files = append(files, fileInfo{
 								Path:     path,
 								ParentID: pid,
+								Name:     relDir,
 							})
 						} else {
 							return fmt.Errorf("没有创建文件夹 %s ，取消上传 %s", filepath.Base(pdir), path)
@@ -777,6 +781,7 @@ func main() {
 			files = append(files, fileInfo{
 				Path:     file,
 				ParentID: config.CID,
+				Name:     filepath.Base(file),
 			})
 		}
 	}
@@ -865,7 +870,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			if err := ossUploadFile(ctx, token, file.Path, file.ParentID, slot); err != nil {
+			if err := ossUploadFile(ctx, token, file.Path, file.Name, file.ParentID, slot); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -890,7 +895,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID, slot); err != nil {
+			if err := multipartUploadFile(ctx, token, file.Path, file.Name, file.ParentID, slot); err != nil {
 				if ctx.Err() != nil {
 					return
 				}

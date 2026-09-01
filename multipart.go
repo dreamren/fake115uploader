@@ -97,14 +97,14 @@ func abortUpload(tm *ossTokenManager, imur oss.InitiateMultipartUploadResult, fi
 }
 
 // 利用 oss 的接口以分片并行的方式上传文件
-func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, slot *progSlot) (e error) {
+func multipartUploadFile(ctx context.Context, ft *fastToken, file string, name string, parentCID uint64, slot *progSlot) (e error) {
 	info, err := os.Stat(file)
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
 	}
 	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 	if info.Size() <= 1024 {
-		return ossUploadFile(ctx, ft, file, parentCID, slot)
+		return ossUploadFile(ctx, ft, file, name, parentCID, slot)
 	}
 	// 上传的文件大小不能超过 115GB
 	if info.Size() > 115*1024*1024*1024 {
@@ -135,7 +135,7 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 	}
 
 	if slot != nil {
-		slot.beginPhase("上传", filepath.Base(file), info.Size())
+		slot.beginPhase("上传", name, info.Size())
 	}
 	// 每个任务独立的速度监控器 + 进度监听（跨分片连续累计）
 	st := newTaskMonitor()
