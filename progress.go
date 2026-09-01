@@ -33,12 +33,13 @@ import (
 
 const (
 	renderRefreshInterval = 100 * time.Millisecond
-	renderMsgLines        = 5   // 消息区固定行数
-	renderPaddingLines    = 1   // 底部留白行数
-	renderBarWidth        = 22  // 进度条格子数
-	renderNameMax         = 34  // 槽位里文件名最大显示宽度
-	renderMsgMaxLen       = 110 // 单条消息最大显示宽度
-	renderColWidth        = 120 // 每行进渲染宽（超出裁剪，防止换行错乱）
+	renderMsgLines        = 5                      // 消息区固定行数
+	renderPaddingLines    = 1                      // 底部留白行数
+	renderBarWidth        = 22                     // 进度条格子数
+	renderNameMax         = 34                     // 槽位里文件名最大显示宽度
+	renderMsgMaxLen       = 110                    // 单条消息最大显示宽度
+	renderColWidth        = 120                    // 每行进渲染宽（超出裁剪，防止换行错乱）
+	speedWindow           = 500 * time.Millisecond // 显示用平均速度的时间窗
 	bottomHint            = "按 q 键停止上传退出"
 )
 
@@ -201,6 +202,9 @@ func (s *progSlot) render() string {
 	if phase == "" {
 		phase = "----"
 	}
+	// 每次刷新画面时按时间窗求一次平均速度，让数字平稳且贴近真实网速
+	s.updateSpeedLocked()
+
 	name := runewidth.Truncate(s.name, renderNameMax, "…")
 	name = runewidth.FillRight(name, renderNameMax)
 
@@ -251,10 +255,9 @@ type progSlot struct {
 	total     int64
 	speedText string
 
-	prevBytes int64
-	prevTime  time.Time
-	ewma      float64 // MB/s
-	ewmaInit  bool
+	winBytes int64     // 当前速度采样窗起点已上传字节
+	winAt    time.Time // 当前速度采样窗起点时间
+	winInit  bool      // 是否已初始化采样窗
 }
 
 func newSlot(idx int) *progSlot {
@@ -268,20 +271,20 @@ func (s *progSlot) beginPhase(phase, name string, total int64) {
 	s.name = name
 	s.total = total
 	s.cur = 0
-	s.ewma = 0
-	s.ewmaInit = false
+	s.winInit = false
+	s.winBytes = 0
 	s.speedText = ""
 	s.mu.Unlock()
 }
 
-// advance 累进已上传/已读取字节并重算速度
+// advance 累进已上传/已读取字节。速度不在这里逐事件计算，
+// 只在 render（按固定刷新节拍）里按时间窗求平均，避免瞬时速率虚高乱跳。
 func (s *progSlot) advance(n int64) {
 	if n <= 0 {
 		return
 	}
 	s.mu.Lock()
 	s.cur += n
-	s.updateSpeedLocked(s.cur)
 	s.mu.Unlock()
 }
 
@@ -292,7 +295,6 @@ func (s *progSlot) setProgress(cur int64) {
 		cur = s.total
 	}
 	s.cur = cur
-	s.updateSpeedLocked(cur)
 	s.mu.Unlock()
 }
 
@@ -312,35 +314,29 @@ func (s *progSlot) finish(phase string) {
 	s.mu.Unlock()
 }
 
-func (s *progSlot) updateSpeedLocked(cur int64) {
+// updateSpeedLocked 按固定时间窗（speedWindow）计算平均速度，更新 speedText。
+// 每次刷新画面时调用一次，窗口不满时不改显示，故数字平稳、接近真实网速。
+// 调用方须已持有 s.mu。
+func (s *progSlot) updateSpeedLocked() {
 	now := time.Now()
-	if !s.ewmaInit {
-		s.ewmaInit = true
-		s.prevBytes = cur
-		s.prevTime = now
-		s.speedText = ""
+	if !s.winInit {
+		s.winInit = true
+		s.winBytes = s.cur
+		s.winAt = now
 		return
 	}
-	dt := now.Sub(s.prevTime).Seconds()
-	dx := float64(cur - s.prevBytes)
-	if dx < 0 {
-		dx = 0
+	elapsed := now.Sub(s.winAt)
+	if elapsed < speedWindow {
+		return
 	}
-	if dt > 0 {
-		inst := dx / dt / 1024 / 1024
-		if s.ewma == 0 {
-			s.ewma = inst
-		} else {
-			s.ewma = 0.7*s.ewma + 0.3*inst
-		}
-	}
-	s.prevBytes = cur
-	s.prevTime = now
-	if s.ewma > 0 {
-		s.speedText = fmt.Sprintf("%.2f MB/s", s.ewma)
+	rate := float64(s.cur-s.winBytes) / elapsed.Seconds() / 1024 / 1024
+	if rate > 0 {
+		s.speedText = fmt.Sprintf("%.2f MB/s", rate)
 	} else {
 		s.speedText = ""
 	}
+	s.winBytes = s.cur
+	s.winAt = now
 }
 
 // 读取时推进进度的 Reader
