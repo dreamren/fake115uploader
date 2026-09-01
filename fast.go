@@ -204,7 +204,7 @@ func (file *fileInfo) fastUploadFile(slot *progSlot) (token *fastToken, e error)
 	if v.GetInt("status") == 2 && v.Exists("statuscode") && v.GetInt("statuscode") == 0 {
 		// 小于 1MB 的文件只在汇总中显示；大文件秒传成功值得单独提示（跳过了整个上传过程）
 		if info, serr := os.Stat(file.Path); serr == nil && info.Size() >= minBarSize {
-			log.Printf("秒传模式上传 %s 成功", file.Path)
+			log.Printf("秒传模式上传 %s 成功", file.Name)
 		}
 		if *removeFile {
 			if err = remove(file.Path); err != nil {

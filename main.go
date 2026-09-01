@@ -842,8 +842,8 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 			slot.finish("跳过")
 		}
 		log.Printf("已跳过 %s：上传速度持续过慢（低于 %g MB/s 超过 %d 秒）",
-			file.Path, config.SlowSpeedMB, config.SlowSeconds)
-		recordFailed(file.Path, file.ParentID)
+			file.Name, config.SlowSpeedMB, config.SlowSeconds)
+		recordFailed(file.Name, file.ParentID)
 		return true
 	}
 
@@ -854,11 +854,11 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 				return
 			}
 			// 秒传失败是常态，不打印日志，结果进汇总
-			recordFailed(file.Path, file.ParentID)
+			recordFailed(file.Name, file.ParentID)
 			return
 		}
 		slot.finish("完成")
-		recordSuccess(file.Path)
+		recordSuccess(file.Name)
 	case *upload:
 		token, err := file.fastUploadFile(slot)
 		if err != nil {
@@ -867,7 +867,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 			}
 			if token == nil {
 				// 获取上传 token 失败，无法继续上传
-				recordFailed(file.Path, file.ParentID)
+				recordFailed(file.Name, file.ParentID)
 				return
 			}
 			if err := ossUploadFile(ctx, token, file.Path, file.Name, file.ParentID, slot); err != nil {
@@ -877,13 +877,13 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 				if skipSlow(err) {
 					return
 				}
-				log.Printf("普通模式上传 %s 出现错误：%v", file.Path, err)
-				recordFailed(file.Path, file.ParentID)
+				log.Printf("普通模式上传 %s 出现错误：%v", file.Name, err)
+				recordFailed(file.Name, file.ParentID)
 				return
 			}
 		}
 		slot.finish("完成")
-		recordSuccess(file.Path)
+		recordSuccess(file.Name)
 	case *multipartUpload:
 		token, err := file.fastUploadFile(slot)
 		if err != nil {
@@ -892,7 +892,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 			}
 			if token == nil {
 				// 获取上传 token 失败，无法继续上传
-				recordFailed(file.Path, file.ParentID)
+				recordFailed(file.Name, file.ParentID)
 				return
 			}
 			if err := multipartUploadFile(ctx, token, file.Path, file.Name, file.ParentID, slot); err != nil {
@@ -902,12 +902,12 @@ func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
 				if skipSlow(err) {
 					return
 				}
-				log.Printf("分片模式上传 %s 出现错误：%v", file.Path, err)
-				recordFailed(file.Path, file.ParentID)
+				log.Printf("分片模式上传 %s 出现错误：%v", file.Name, err)
+				recordFailed(file.Name, file.ParentID)
 				return
 			}
 		}
 		slot.finish("完成")
-		recordSuccess(file.Path)
+		recordSuccess(file.Name)
 	}
 }
