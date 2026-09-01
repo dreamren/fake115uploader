@@ -14,46 +14,7 @@ import (
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
-	"github.com/cheggaaa/pb/v3"
 )
-
-// 进度监听
-type multipartProgressListener struct {
-	bar  *pb.ProgressBar
-	last int64 // 上一次进度事件时该分片已上传的字节数
-}
-
-// 实现 oss.ProgressListener 的接口
-func (listener *multipartProgressListener) ProgressChanged(event *oss.ProgressEvent) {
-	if listener == nil || listener.bar == nil {
-		return
-	}
-	switch event.EventType {
-	case oss.TransferStartedEvent:
-		listener.last = 0
-	case oss.TransferDataEvent:
-		// 实时更新进度，避免上传大文件时进度条长时间停留在 0%
-		listener.bar.Add64(event.ConsumedBytes - listener.last)
-		listener.last = event.ConsumedBytes
-	case oss.TransferCompletedEvent:
-		listener.bar.Add64(event.ConsumedBytes - listener.last)
-		listener.last = 0
-	case oss.TransferFailedEvent:
-		// 分片上传失败，回滚该分片已计入进度的字节数
-		listener.bar.Add64(-listener.last)
-		listener.last = 0
-	default:
-	}
-}
-
-// 回滚已显示的进度
-func (listener *multipartProgressListener) rollback() {
-	if listener == nil || listener.bar == nil {
-		return
-	}
-	listener.bar.Add64(-listener.last)
-	listener.last = 0
-}
 
 // 按文件大小分割分片，优先使用指定的分片数量，否则按分片大小分片
 func splitChunks(file string, size int64) ([]oss.FileChunk, error) {
@@ -74,9 +35,11 @@ func splitChunks(file string, size int64) ([]oss.FileChunk, error) {
 	return oss.SplitFileByPartSize(file, partSize)
 }
 
-// 上传单个分片，出现错误就重试，共尝试 3 次
+// 上传单个分片，出现错误就重试，共尝试 3 次。
+// st 是本任务独立的速度监控器，abortableReader 依赖它的中止标志；
+// 若速度过慢已触发中止，直接返回哨兵错误 errUploadTooSlow（不重试）。
 func uploadPartWithRetry(ctx context.Context, tm *ossTokenManager, imur oss.InitiateMultipartUploadResult,
-	f *os.File, chunk oss.FileChunk, file string, bar *pb.ProgressBar) (oss.UploadPart, error) {
+	f *os.File, st *uploadStats, chunk oss.FileChunk, file string, prog *taskProgress) (oss.UploadPart, error) {
 	var lastErr error
 	for retry := 0; retry < 3; retry++ {
 		if err := ctx.Err(); err != nil {
@@ -90,17 +53,22 @@ func uploadPartWithRetry(ctx context.Context, tm *ossTokenManager, imur oss.Init
 		if _, err := f.Seek(chunk.Offset, io.SeekStart); err != nil {
 			return oss.UploadPart{}, fmt.Errorf("移动 %s 的读取位置出现错误：%w", file, err)
 		}
-		listener := &multipartProgressListener{bar: bar}
-		part, err := bucket.UploadPart(imur, f, chunk.Size, chunk.Number,
+		// 用可中断的 reader 包装分片读取，速度过慢触发时立刻中断本次分片上传
+		wrapped := newAbortableReader(f, st.abort)
+		part, err := bucket.UploadPart(imur, wrapped, chunk.Size, chunk.Number,
 			oss.SetHeader("x-oss-security-token", ot.SecurityToken),
 			oss.UserAgentHeader(aliUserAgent),
-			oss.Progress(listener),
+			oss.Progress(prog),
 		)
 		if err == nil {
 			return part, nil
 		}
-		// 回滚失败分片已显示的进度
-		listener.rollback()
+		if errors.Is(err, errUploadTooSlow) {
+			// 已判定整任务速度过慢，跳过，不做无意义的重试
+			return oss.UploadPart{}, errUploadTooSlow
+		}
+		// 清理本次分片已计入的累计值，避免重试时重复累计
+		prog.reset()
 
 		lastErr = err
 		log.Printf("上传 %s 的第%d个分片时出现错误：%v", file, chunk.Number, err)
@@ -129,14 +97,14 @@ func abortUpload(tm *ossTokenManager, imur oss.InitiateMultipartUploadResult, fi
 }
 
 // 利用 oss 的接口以分片并行的方式上传文件
-func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, tb *taskBar) (e error) {
+func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parentCID uint64, slot *progSlot) (e error) {
 	info, err := os.Stat(file)
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
 	}
 	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
 	if info.Size() <= 1024 {
-		return ossUploadFile(ctx, ft, file, parentCID, tb)
+		return ossUploadFile(ctx, ft, file, parentCID, slot)
 	}
 	// 上传的文件大小不能超过 115GB
 	if info.Size() > 115*1024*1024*1024 {
@@ -166,11 +134,12 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 		return fmt.Errorf("初始化 %s 的分片上传出现错误：%w", file, err)
 	}
 
-	tb.beginUpload(filepath.Base(file), info.Size())
-	var uploadBar *pb.ProgressBar
-	if tb != nil {
-		uploadBar = tb.bar
+	if slot != nil {
+		slot.beginPhase("上传", filepath.Base(file), info.Size())
 	}
+	// 每个任务独立的速度监控器 + 进度监听（跨分片连续累计）
+	st := newTaskMonitor()
+	prog := newTaskProgress(slot, st)
 
 	// 顺序模式要求分片按序号依次上传，只能串行上传分片
 	f, err := os.Open(file)
@@ -193,7 +162,7 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, parent
 		if *verbose {
 			log.Printf("正在上传 %s 的第%d个分片（共%d个分片）", file, chunk.Number, len(chunks))
 		}
-		part, err := uploadPartWithRetry(ctx, tm, imur, f, chunk, file, uploadBar)
+		part, err := uploadPartWithRetry(ctx, tm, imur, f, st, chunk, file, prog)
 		if err != nil {
 			abortUpload(tm, imur, file)
 			return err

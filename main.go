@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -68,20 +69,24 @@ var (
 	proxyPassword   string
 	httpClient      = &http.Client{Timeout: 30 * time.Second}
 	ecdhCipher      *cipher.EcdhCipher
+	logFileName     string        // -log-file 参数指定的日志文件名
+	logFileWriter   io.Writer     // -log-file 打开的文件 writer，可为 nil
 )
 
 // 设置数据
 type uploadConfig struct {
-	Cookies           string `json:"cookies"`           // 115 网页版的 Cookie
-	CID               uint64 `json:"cid"`               // 115 里文件夹的 cid
-	ResultDir         string `json:"resultDir"`         // 在指定文件夹保存上传结果
-	HTTPRetry         uint   `json:"httpRetry"`         // HTTP 请求失败后的重试次数
-	HTTPProxy         string `json:"httpProxy"`         // HTTP 代理
-	OSSProxy          string `json:"ossProxy"`          // OSS 上传代理
-	PartsNum          uint   `json:"partsNum"`          // 分片上传的分片数量
-	PartSizeMB        int    `json:"partSizeMB"`        // 分片上传的分片大小（MB）
-	ParallelParts     int    `json:"parallelParts"`     // 分片上传时每个文件的并行分片数
-	ConcurrentUploads int    `json:"concurrentUploads"` // 同时上传的任务数
+	Cookies           string  `json:"cookies"`           // 115 网页版的 Cookie
+	CID               uint64  `json:"cid"`               // 115 里文件夹的 cid
+	ResultDir         string  `json:"resultDir"`         // 在指定文件夹保存上传结果
+	HTTPRetry         uint    `json:"httpRetry"`         // HTTP 请求失败后的重试次数
+	HTTPProxy         string  `json:"httpProxy"`         // HTTP 代理
+	OSSProxy          string  `json:"ossProxy"`          // OSS 上传代理
+	PartsNum          uint    `json:"partsNum"`          // 分片上传的分片数量
+	PartSizeMB        int     `json:"partSizeMB"`        // 分片上传的分片大小（MB）
+	ParallelParts     int     `json:"parallelParts"`     // 分片上传时每个文件的并行分片数
+	ConcurrentUploads int     `json:"concurrentUploads"` // 同时上传的任务数
+	SlowSpeedMB       float64 `json:"slowSpeedMB"`       // 上传时速度低于该值（MB/s）开始计时，0 表示不启用低速检测
+	SlowSeconds       int     `json:"slowSeconds"`       // 上传时连续低速达到该秒数则取消并跳过该任务，0 表示不启用
 }
 
 // 上传失败的文件信息
@@ -446,6 +451,8 @@ func initialize() (e error) {
 	parallelParts := flag.Int("parallel-parts", 0, "已无效：115 要求分片按序上传，分片无法并行，请用 -concurrent-uploads 提升速度")
 	concurrentUploads := flag.Int("concurrent-uploads", 0, "同时上传的最大`任务数`，范围为 1 到 10，默认为 0（即 2）")
 	logFile := flag.String("log-file", "", "将日志保存到指定`文件`（推荐：进度条会截断终端日志，日志文件里的内容才是完整的）")
+	slowSpeed := flag.Float64("slow-speed", 0, "上传时速度低于该`速度`（单位 MB/s）开始计时，0 表示不启用低速检测")
+	slowSeconds := flag.Int("slow-seconds", 0, "上传时连续低速超过该`秒数`则取消并跳过该任务（需要同时设置 -slow-speed），0 表示不启用")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")
 
@@ -458,8 +465,8 @@ func initialize() (e error) {
 			log.Fatalf("打开日志文件 %s 出现错误：%v", *logFile, err)
 		}
 		defer lf.Close()
-		log.SetOutput(io.MultiWriter(os.Stderr, lf))
-		log.Printf("日志同时保存到 %s", *logFile)
+		logFileName = *logFile
+		logFileWriter = lf
 	}
 
 	if *configFile == "" {
@@ -538,6 +545,25 @@ func initialize() (e error) {
 	if config.ConcurrentUploads < 1 || config.ConcurrentUploads > 10 {
 		log.Printf("同时上传的任务数不能小于1或大于10")
 		os.Exit(1)
+	}
+
+	// 低速检测参数，命令行优先级高于设置文件；负值当作未设置
+	if *slowSpeed != 0 {
+		config.SlowSpeedMB = *slowSpeed
+	}
+	if *slowSeconds != 0 {
+		config.SlowSeconds = *slowSeconds
+	}
+	if config.SlowSpeedMB < 0 {
+		config.SlowSpeedMB = 0
+	}
+	if config.SlowSeconds < 0 {
+		config.SlowSeconds = 0
+	}
+	if (config.SlowSeconds > 0) != (config.SlowSpeedMB > 0) {
+		log.Printf("低速检测需要同时设置 slowSpeedMB 和 slowSeconds，当前只设置了其中一个，不启用低速检测")
+		config.SlowSpeedMB = 0
+		config.SlowSeconds = 0
 	}
 
 	// 优先使用参数指定的 Cookie
@@ -641,7 +667,7 @@ func initialize() (e error) {
 
 func main() {
 	defer func() {
-		stopBarPool()
+		stopRenderer()
 		if len(result.Failed) != 0 {
 			os.Exit(1)
 		}
@@ -755,10 +781,16 @@ func main() {
 		}
 	}
 
-	// 多个任务并行上传，每个任务固定占用一行进度条
+	// 初始化渲染器：无论是否上传文件都要创建槽位，供各 worker 认领；
+	// 渲染器本身（屏幕重绘）只在 stdout 是终端时启动。日志统一经日志 sink
+	// 输出：渲染模式进消息区，否则回落到 stderr/日志文件。
+	initRenderer(config.ConcurrentUploads)
+	setupLogSink()
 	if len(files) > 0 {
-		fmt.Println("按 q 键停止上传并退出程序")
-		startBarPool()
+		if logFileName != "" {
+			log.Printf("日志同时保存到 %s", logFileName)
+		}
+		startRenderer()
 	}
 	tasks := make(chan fileInfo)
 	var wg sync.WaitGroup
@@ -772,33 +804,44 @@ func main() {
 			}
 		}
 	}()
-	for i := 0; i < config.ConcurrentUploads; i++ {
+	// 每个 worker 认领一个固定槽位，处理多个文件时复用同一行，行号绝不变化。
+	// 不同任务之间永远不会互相覆盖。
+	concurrent := config.ConcurrentUploads
+	for i := 0; i < concurrent; i++ {
 		wg.Add(1)
+		slot := bar.slots[i]
 		go func() {
 			defer wg.Done()
-			var tb *taskBar
 			for file := range tasks {
-				if tb == nil {
-					tb = newTaskBar()
-				}
-				file.uploadFile(ctx, tb)
+				file.uploadFile(ctx, slot)
 			}
-			// 不调用进度条的 Finish：进度走满时模板已显示 100% 定格，
-			// 而 Finish 会让进度条池在所有任务完成后停止渲染，
-			// 之后其他任务新加入的进度条将无法显示
 		}()
 	}
 	wg.Wait()
 
 	// 先停止进度条渲染，再打印上传结果汇总，避免进度条重绘覆盖汇总信息
-	stopBarPool()
+	stopRenderer()
 }
 
-// 上传文件
-func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
+// 上传文件。slot 是本 worker 认领的固定进度槽位。
+func (file *fileInfo) uploadFile(ctx context.Context, slot *progSlot) {
+	// 处理低速跳过的公共逻辑：只是跳过（不重试、不计失败），在槽位上标"跳过"
+	skipSlow := func(err error) bool {
+		if !errors.Is(err, errUploadTooSlow) {
+			return false
+		}
+		if slot != nil {
+			slot.finish("跳过")
+		}
+		log.Printf("已跳过 %s：上传速度持续过慢（低于 %g MB/s 超过 %d 秒）",
+			file.Path, config.SlowSpeedMB, config.SlowSeconds)
+		recordFailed(file.Path, file.ParentID)
+		return true
+	}
+
 	switch {
 	case *fastUpload:
-		if _, err := file.fastUploadFile(tb); err != nil {
+		if _, err := file.fastUploadFile(slot); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -806,9 +849,10 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 			recordFailed(file.Path, file.ParentID)
 			return
 		}
+		slot.finish("完成")
 		recordSuccess(file.Path)
 	case *upload:
-		token, err := file.fastUploadFile(tb)
+		token, err := file.fastUploadFile(slot)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -818,8 +862,11 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			if err := ossUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
+			if err := ossUploadFile(ctx, token, file.Path, file.ParentID, slot); err != nil {
 				if ctx.Err() != nil {
+					return
+				}
+				if skipSlow(err) {
 					return
 				}
 				log.Printf("普通模式上传 %s 出现错误：%v", file.Path, err)
@@ -827,9 +874,10 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 				return
 			}
 		}
+		slot.finish("完成")
 		recordSuccess(file.Path)
 	case *multipartUpload:
-		token, err := file.fastUploadFile(tb)
+		token, err := file.fastUploadFile(slot)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -839,8 +887,11 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 				recordFailed(file.Path, file.ParentID)
 				return
 			}
-			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID, tb); err != nil {
+			if err := multipartUploadFile(ctx, token, file.Path, file.ParentID, slot); err != nil {
 				if ctx.Err() != nil {
+					return
+				}
+				if skipSlow(err) {
 					return
 				}
 				log.Printf("分片模式上传 %s 出现错误：%v", file.Path, err)
@@ -848,6 +899,7 @@ func (file *fileInfo) uploadFile(ctx context.Context, tb *taskBar) {
 				return
 			}
 		}
+		slot.finish("完成")
 		recordSuccess(file.Path)
 	}
 }
