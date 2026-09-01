@@ -33,24 +33,25 @@ import (
 
 const (
 	renderRefreshInterval = 100 * time.Millisecond
-	renderMsgLines        = 5    // 消息区固定行数
-	renderPaddingLines    = 1    // 底部留白行数
-	renderBarWidth        = 22   // 进度条格子数
-	renderNameMax         = 34   // 槽位里文件名最大显示宽度
-	renderMsgMaxLen       = 110  // 单条消息最大显示宽度
-	renderColWidth        = 120  // 每行进渲染宽（超出裁剪，防止换行错乱）
+	renderMsgLines        = 5   // 消息区固定行数
+	renderPaddingLines    = 1   // 底部留白行数
+	renderBarWidth        = 22  // 进度条格子数
+	renderNameMax         = 34  // 槽位里文件名最大显示宽度
+	renderMsgMaxLen       = 110 // 单条消息最大显示宽度
+	renderColWidth        = 120 // 每行进渲染宽（超出裁剪，防止换行错乱）
 	bottomHint            = "按 q 键停止上传退出"
 )
 
 type barRenderer struct {
 	mu        sync.Mutex
 	out       io.Writer
-	ttl       bool         // stdout 是否为终端
+	ttl       bool // stdout 是否为终端
 	running   bool
 	stop      chan struct{}
 	rowsTotal int
-	msgs      []string     // 消息区内容（从旧到新，最多 renderMsgLines 条）
-	slots     []*progSlot  // 每个并发任务一个固定槽位
+	width     int         // 当前终端宽度（列数），用于裁剪行内容防止换行错位
+	msgs      []string    // 消息区内容（从旧到新，最多 renderMsgLines 条）
+	slots     []*progSlot // 每个并发任务一个固定槽位
 }
 
 // 全局渲染器。Stdout 是终端时启用，否则不启用。
@@ -61,10 +62,10 @@ var bar = &barRenderer{}
 // 但无论是否渲染都创建槽位，保证各任务在非终端下也有安全的进度载体。
 // 必须在并发 worker 启动前调用一次。
 func initRenderer(concurrent int) {
-	info, err := os.Stdout.Stat()
 	bar.mu.Lock()
 	defer bar.mu.Unlock()
-	bar.ttl = err == nil && info.Mode()&os.ModeCharDevice != 0
+	bar.ttl = terminalIsTTY()
+	bar.width = consoleWidth()
 	bar.out = os.Stdout
 	bar.slots = bar.slots[:0]
 	for i := 0; i < concurrent; i++ {
@@ -173,14 +174,22 @@ func writeLine(b *strings.Builder, content string) {
 }
 
 func (r *barRenderer) trunc(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
 	if runewidth.StringWidth(s) <= max {
 		return s
 	}
 	return runewidth.Truncate(s, max-1, "…")
 }
 
+// pad 把一行补齐（或截断）到当前终端宽度，保证占用恰好一行、不换行错位
 func (r *barRenderer) pad(s string) string {
-	return runewidth.FillRight(s, renderColWidth)
+	w := r.width
+	if w <= 0 {
+		w = renderColWidth
+	}
+	return runewidth.FillRight(r.trunc(s, w), w)
 }
 
 // 槽位渲染文本

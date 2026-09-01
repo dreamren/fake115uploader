@@ -69,8 +69,8 @@ var (
 	proxyPassword   string
 	httpClient      = &http.Client{Timeout: 30 * time.Second}
 	ecdhCipher      *cipher.EcdhCipher
-	logFileName     string        // -log-file 参数指定的日志文件名
-	logFileWriter   io.Writer     // -log-file 打开的文件 writer，可为 nil
+	logFileName     string    // -log-file 参数指定的日志文件名
+	logFileWriter   io.Writer // -log-file 打开的文件 writer，可为 nil
 )
 
 // 设置数据
@@ -784,6 +784,9 @@ func main() {
 	// 初始化渲染器：无论是否上传文件都要创建槽位，供各 worker 认领；
 	// 渲染器本身（屏幕重绘）只在 stdout 是终端时启动。日志统一经日志 sink
 	// 输出：渲染模式进消息区，否则回落到 stderr/日志文件。
+	// Windows 的 conhost 默认不解释 ANSI 序列，必须先开启虚拟终端处理（VT），
+	// 否则进度条会以文本形式堆叠显示。
+	enableConsoleAnsi()
 	initRenderer(config.ConcurrentUploads)
 	setupLogSink()
 	if len(files) > 0 {
