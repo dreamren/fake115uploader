@@ -81,7 +81,6 @@ type uploadConfig struct {
 	HTTPRetry         uint    `json:"httpRetry"`         // HTTP 请求失败后的重试次数
 	HTTPProxy         string  `json:"httpProxy"`         // HTTP 代理
 	OSSProxy          string  `json:"ossProxy"`          // OSS 上传代理
-	PartsNum          uint    `json:"partsNum"`          // 分片上传的分片数量
 	PartSizeMB        int     `json:"partSizeMB"`        // 分片上传的分片大小（MB）
 	ParallelParts     int     `json:"parallelParts"`     // 分片上传时每个文件的并行分片数
 	ConcurrentUploads int     `json:"concurrentUploads"` // 同时上传的任务数
@@ -447,7 +446,7 @@ func initialize() (e error) {
 	ossProxy := flag.String("oss-proxy", "", "指定 OSS 上传使用的`代理`")
 	httpRetry := flag.Uint("http-retry", 0, "HTTP 请求失败后的`重试次数`，默认为 0（即不重试）")
 	recursive = flag.Bool("recursive", false, "递归上传文件夹")
-	partsNum := flag.Uint("parts-num", 0, "分片模式上传文件的`分片数量`，范围为 1 到 10000，设置后忽略分片大小")
+	partsNum := flag.Uint("parts-num", 0, "已废弃：分片数量不再由参数指定，文件小于等于分片大小时直接普通上传")
 	partSize := flag.Int("part-size", 0, "分片模式上传文件的`分片大小`，单位为 MB，范围为 1 到 5120，默认为 0（即 128MB）")
 	parallelParts := flag.Int("parallel-parts", 0, "已无效：115 要求分片按序上传，分片无法并行，请用 -concurrent-uploads 提升速度")
 	concurrentUploads := flag.Int("concurrent-uploads", 0, "同时上传的最大`任务数`，范围为 1 到 10，默认为 0（即 2）")
@@ -495,20 +494,12 @@ func initialize() (e error) {
 		os.Exit(1)
 	}
 
-	if *partsNum != 0 && !*multipartUpload {
-		log.Println("-parts-num 参数只支持分片上传模式")
-		os.Exit(1)
-	}
 	if (*partSize != 0 || *parallelParts != 0) && !*multipartUpload {
 		log.Println("-part-size 和 -parallel-parts 参数只支持分片上传模式")
 		os.Exit(1)
 	}
-	// 优先使用参数指定的分片数量
 	if *partsNum != 0 {
-		config.PartsNum = *partsNum
-	}
-	if config.PartsNum > maxParts {
-		log.Printf("分片数量不能大于%d", maxParts)
+		log.Println("-parts-num 参数已废弃，不再使用")
 		os.Exit(1)
 	}
 

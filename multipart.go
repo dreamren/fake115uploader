@@ -16,17 +16,18 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
 
-// 按文件大小分割分片，优先使用指定的分片数量，否则按分片大小分片
-func splitChunks(file string, size int64) ([]oss.FileChunk, error) {
-	if config.PartsNum != 0 {
-		return oss.SplitFileByPartNum(file, int(config.PartsNum))
-	}
-
+// 返回分片模式的基础分片大小（PartSizeMB，最小 100KB）
+func basePartSize() int64 {
 	partSize := int64(config.PartSizeMB) * 1024 * 1024
-	// 单个分片大小不能小于 100KB
 	if partSize < 100*1024 {
 		partSize = 100 * 1024
 	}
+	return partSize
+}
+
+// 按分片大小分割文件，分片数量超过上限时放大片的大小
+func splitChunks(file string, size int64) ([]oss.FileChunk, error) {
+	partSize := basePartSize()
 	// 分片数量不能超过 maxParts，超过时按分片数量上限重新计算分片大小
 	if size > partSize*maxParts {
 		partSize = (size + maxParts - 1) / maxParts
@@ -102,8 +103,8 @@ func multipartUploadFile(ctx context.Context, ft *fastToken, file string, name s
 	if err != nil {
 		return fmt.Errorf("获取 %s 的信息出现错误：%w", file, err)
 	}
-	// 分片模式上传的文件大小不能小于 1KB（1KB 这个大小属于推测，没详细测试过）
-	if info.Size() <= 1024 {
+	// 小于等于单个分片大小的文件，分了就只有一片，直接改用普通上传，不走分片
+	if info.Size() <= basePartSize() {
 		return ossUploadFile(ctx, ft, file, name, parentCID, slot)
 	}
 	// 上传的文件大小不能超过 115GB
