@@ -86,6 +86,7 @@ type uploadConfig struct {
 	ConcurrentUploads int     `json:"concurrentUploads"` // 同时上传的任务数
 	SlowSpeedMB       float64 `json:"slowSpeedMB"`       // 上传时速度低于该值（MB/s）开始计时，0 表示不启用低速检测
 	SlowSeconds       int     `json:"slowSeconds"`       // 上传时连续低速达到该秒数则取消并跳过该任务，0 表示不启用
+	NotifyURL         string  `json:"notifyURL"`         // cookie 失效时访问的通知 URL，为空表示不通知
 }
 
 // 上传失败的文件信息
@@ -262,6 +263,27 @@ func doRequest(req *http.Request) (resp *http.Response, err error) {
 	return nil, fmt.Errorf("http 请求出现错误：%w", err)
 }
 
+// cookie 失效时访问设置文件里的 notifyURL 执行通知动作
+func notifyCookieInvalid() {
+	if config.NotifyURL == "" {
+		return
+	}
+	req, err := http.NewRequest(http.MethodGet, config.NotifyURL, nil)
+	if err != nil {
+		log.Printf("构造 cookie 失效通知请求 %s 出现错误：%v", config.NotifyURL, err)
+		return
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := doRequest(req)
+	if err != nil {
+		log.Printf("访问 cookie 失效通知 URL %s 出现错误：%v", config.NotifyURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	log.Printf("cookie 已失效，已访问通知 URL %s ，状态码：%d", config.NotifyURL, resp.StatusCode)
+}
+
 // 获取 userID 和 userKey
 func getUserKey() (e error) {
 	defer func() {
@@ -288,6 +310,8 @@ func getUserKey() (e error) {
 	userKey = string(v.GetStringBytes("userkey"))
 
 	if userID == "0" {
+		// 115 能正常响应但拿不到 user_id，说明 cookie 已失效，执行通知动作
+		notifyCookieInvalid()
 		panic(fmt.Errorf("获取 userkey 出错，请确定 cookies 是否设置好"))
 	}
 
@@ -453,6 +477,7 @@ func initialize() (e error) {
 	logFile := flag.String("log-file", "", "将日志保存到指定`文件`（推荐：进度条会截断终端日志，日志文件里的内容才是完整的）")
 	slowSpeed := flag.Float64("slow-speed", 0, "上传时速度低于该`速度`（单位 MB/s）开始计时，0 表示不启用低速检测")
 	slowSeconds := flag.Int("slow-seconds", 0, "上传时连续低速超过该`秒数`则取消并跳过该任务（需要同时设置 -slow-speed），0 表示不启用")
+	notifyURL := flag.String("notify-url", "", "cookie 失效时访问的通知 `URL`，默认为空（即使用设置文件里的 notifyURL）")
 	verbose = flag.Bool("v", false, "显示更详细的信息（调试用）")
 	help := flag.Bool("h", false, "显示帮助信息")
 
@@ -569,6 +594,12 @@ func initialize() (e error) {
 	if *verbose {
 		log.Printf("Cookies的值为：%s", config.Cookies)
 	}
+
+	// 优先使用参数指定的通知 URL
+	if *notifyURL != "" {
+		config.NotifyURL = *notifyURL
+	}
+	config.NotifyURL = strings.TrimSpace(config.NotifyURL)
 
 	// 优先使用参数指定的 cid
 	if *cid != 1 {
